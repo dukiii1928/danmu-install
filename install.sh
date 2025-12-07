@@ -1,273 +1,454 @@
 #!/usr/bin/env bash
-# 一键部署 LogVar 弹幕 API (Docker 版)
-# 适用于：Debian / Ubuntu / 其他使用 apt 的发行版
+# LogVar 弹幕 API · Docker 高级一键部署脚本
+# 用法：
+#   安装 / 更新：bash install.sh
+#   卸载 / 清理：bash install.sh uninstall
+#   查看状态：  bash install.sh status
+
 set -e
 
-#######################################
-# 工具函数
-#######################################
-print_line() {
-  printf '\n============================================================\n'
-}
+### ============ 彩色输出函数 ============
 
-ask_with_default() {
-  local prompt="$1"
-  local default="$2"
-  local var
-  read -rp "${prompt} [默认: ${default}] " var
-  if [[ -z "${var}" ]]; then
-    echo "${default}"
-  else
-    echo "${var}"
+COLOR_RESET="\e[0m"
+COLOR_GREEN="\e[32m"
+COLOR_YELLOW="\e[33m"
+COLOR_RED="\e[31m"
+COLOR_CYAN="\e[36m"
+
+info()    { echo -e "${COLOR_CYAN}[INFO]${COLOR_RESET} $*"; }
+success() { echo -e "${COLOR_GREEN}[OK]  ${COLOR_RESET} $*"; }
+warn()    { echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"; }
+error()   { echo -e "${COLOR_RED}[ERR] ${COLOR_RESET} $*"; }
+
+### ============ 基本检查 ============
+
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    error "请使用 root 身份运行脚本（sudo bash install.sh）"
+    exit 1
   fi
 }
 
-ask_yes_no() {
-  local prompt="$1"
-  local default="$2"   # y 或 n
-  local var
-  local default_text
+check_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
 
-  if [[ "${default}" == "y" ]]; then
-    default_text="Y/n"
-  else
-    default_text="y/N"
+### ============ 安装 curl & Docker ============
+
+install_curl() {
+  if ! check_cmd curl; then
+    info "正在安装 curl..."
+    apt-get update -y
+    apt-get install -y curl
+    success "curl 安装完成"
+  fi
+}
+
+install_docker() {
+  if check_cmd docker; then
+    success "检测到 Docker 已安装"
+    return
   fi
 
+  info "正在安装 Docker..."
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg lsb-release
+
+  install -m 0755 -d /etc/apt/keyrings
+  if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  fi
+
+  local codename
+  codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+    ${codename} stable" > /etc/apt/sources.list.d/docker.list
+
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io
+
+  systemctl enable docker
+  systemctl start docker
+  success "Docker 安装完成"
+}
+
+### ============ 公网 IP 检测 ============
+
+detect_ipv4() {
+  curl -4 -fsS ifconfig.co 2>/dev/null || \
+  curl -4 -fsS icanhazip.com 2>/dev/null || \
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+detect_ipv6() {
+  curl -6 -fsS ifconfig.co 2>/dev/null || \
+  curl -6 -fsS icanhazip.com 2>/dev/null || true
+}
+
+### ============ 端口占用检测 ============
+
+ensure_port() {
+  local port
   while true; do
-    read -rp "${prompt} [${default_text}] " var
-    var="${var,,}"   # 转小写
+    read -rp "请输入对外访问端口 [回车默认 8080]: " port
+    port="${port:-8080}"
 
-    if [[ -z "${var}" ]]; then
-      var="${default}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+      warn "端口无效，请输入 1-65535 的整数"
+      continue
     fi
 
-    case "${var}" in
-      y|yes) echo "y"; return 0 ;;
-      n|no)  echo "n"; return 0 ;;
-      *) echo "请输入 y 或 n." ;;
-    esac
+    if ss -tuln 2>/dev/null | grep -q ":$port "; then
+      warn "端口 $port 已被占用"
+      read -rp "仍然继续使用该端口？[y/N]: " yn
+      case "$yn" in
+        [Yy]*) ;;
+        *) continue ;;
+      esac
+    fi
+
+    PORT="$port"
+    break
   done
 }
 
-detect_pkg_mgr() {
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "apt"
-  elif command -v yum >/dev/null 2>&1; then
-    echo "yum"
-  elif command -v dnf >/dev/null 2>&1; then
-    echo "dnf"
-  else
-    echo "unknown"
-  fi
-}
+### ============ 卸载 / 清理 ============
 
-ensure_cmd() {
-  local cmd="$1"
-  local pkg="$2"
+uninstall_all() {
+  require_root
+  info "开始卸载 danmu-api 及相关组件..."
 
-  if command -v "${cmd}" >/dev/null 2>&1; then
-    return 0
+  if docker ps -a --format '{{.Names}}' | grep -q '^danmu-api$'; then
+    info "停止并删除 danmu-api 容器..."
+    docker stop danmu-api >/dev/null 2>&1 || true
+    docker rm danmu-api >/dev/null 2>&1 || true
   fi
 
-  local mgr
-  mgr="$(detect_pkg_mgr)"
-  echo "未检测到 ${cmd}，正在安装 ${pkg}..."
-
-  case "${mgr}" in
-    apt)
-      apt-get update -y
-      apt-get install -y "${pkg}"
-      ;;
-    yum)
-      yum install -y "${pkg}"
-      ;;
-    dnf)
-      dnf install -y "${pkg}"
-      ;;
-    *)
-      echo "无法自动安装 ${pkg}，请手动安装后重试。"
-      exit 1
-      ;;
-  esac
-}
-
-detect_ip() {
-  # 优先获取公网 IP，失败再回退到内网 IP
-  local ip
-  ip="$(curl -fsSL ipv4.icanhazip.com 2>/dev/null || curl -fsSL ifconfig.me 2>/dev/null || true)"
-  if [[ -n "${ip}" ]]; then
-    echo "${ip}"
-  else
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo "${ip:-你的服务器IP}"
+  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-danmu-api$'; then
+    info "停止并删除 Watchtower 容器..."
+    docker stop watchtower-danmu-api >/dev/null 2>&1 || true
+    docker rm watchtower-danmu-api >/dev/null 2>&1 || true
   fi
+
+  if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q '^logyar/danmu-api:'; then
+    read -rp "是否删除 danmu-api 镜像？[y/N]: " yn
+    case "$yn" in
+      [Yy]*)
+        docker rmi logyar/danmu-api:latest >/dev/null 2>&1 || true
+        ;;
+    esac
+  fi
+
+  rm -f .env.danmu-api docker-compose.danmu-api.yml README_danmu-api.txt
+
+  success "卸载 / 清理完成"
+  exit 0
 }
 
-#######################################
-# 0. 检查 root 权限
-#######################################
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "请使用 root 运行此脚本（sudo su 或 sudo bash install.sh）"
-  exit 1
-fi
+### ============ 状态查看 ============
 
-clear
-print_line
-echo "         LogVar 弹幕 API · Docker 超级一键部署脚本"
-print_line
-echo
-
-#######################################
-# 1. 收集配置
-#######################################
-
-# 端口
-PORT="$(ask_with_default "请输入服务端口" "8080")"
-
-# TOKEN 与 ADMIN_TOKEN
-TOKEN="$(ask_with_default "请输入普通访问 TOKEN" "123987456")"
-ADMIN_TOKEN="$(ask_with_default "请输入管理访问 ADMIN_TOKEN" "admin_888999")"
-
-# 颜色模式
-echo
-echo "请选择弹幕颜色转换模式（CONVERT_COLOR）："
-echo "  1) default - 不转换弹幕颜色"
-echo "  2) white   - 将所有非白色弹幕转换为纯白色"
-echo "  3) color   - 将所有白色弹幕转换为随机颜色（包含白色，白色概率更高）"
-COLOR_CHOICE="$(ask_with_default "请输入选项序号" "3")"
-
-case "${COLOR_CHOICE}" in
-  1) CONVERT_COLOR="default" ;;
-  2) CONVERT_COLOR="white" ;;
-  3) CONVERT_COLOR="color" ;;
-  *) echo "输入无效，使用默认 color"; CONVERT_COLOR="color" ;;
-esac
-
-# 是否启用自动更新（watchtower）
-AUTO_UPDATE="$(ask_yes_no "是否启用每日 04:00 自动拉取最新镜像并重启容器？" "y")"
-
-#######################################
-# 2. 安装依赖：curl & docker
-#######################################
-echo
-print_line
-echo "正在安装依赖：curl / docker..."
-print_line
-
-ensure_cmd curl curl
-if ! command -v docker >/dev/null 2>&1; then
-  echo "未检测到 docker，正在安装..."
-  mgr="$(detect_pkg_mgr)"
-  case "${mgr}" in
-    apt)
-      apt-get update -y
-      apt-get install -y docker.io
-      ;;
-    yum)
-      yum install -y docker
-      ;;
-    dnf)
-      dnf install -y docker
-      ;;
-    *)
-      echo "无法自动安装 docker，请手动安装后重试。"
-      exit 1
-      ;;
-  esac
-fi
-
-# 启动并设置 docker 开机自启
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl enable --now docker
-else
-  service docker start || true
-fi
-
-#######################################
-# 3. 部署 danmu-api 容器
-#######################################
-echo
-print_line
-echo "开始部署 danmu-api 容器..."
-print_line
-
-# 先删除旧容器（若存在）
-docker rm -f danmu-api >/dev/null 2>&1 || true
-docker rm -f danmu-watchtower >/dev/null 2>&1 || true
-
-# 拉取镜像（可选：直接 run 会自动拉取，这里仅提示一下）
-echo "拉取镜像 logvar/danmu-api:latest ..."
-docker pull logvar/danmu-api:latest
-
-# 启动弹幕 API 容器
-docker run -d \
-  --name danmu-api \
-  -p "${PORT}:9321" \
-  -e TOKEN="${TOKEN}" \
-  -e ADMIN_TOKEN="${ADMIN_TOKEN}" \
-  -e CONVERT_COLOR="${CONVERT_COLOR}" \
-  --restart unless-stopped \
-  logvar/danmu-api:latest
-
-#######################################
-# 4. 部署自动更新（可选）
-#######################################
-if [[ "${AUTO_UPDATE}" == "y" ]]; then
+show_status() {
+  info "当前 Docker 容器状态："
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
+    | sed 's/^/  /'
   echo
-  print_line
-  echo "启用 Watchtower 自动更新（每天 04:00 检查 danmu-api 镜像并更新）..."
-  print_line
+  info "如需查看日志：docker logs -f danmu-api"
+  exit 0
+}
 
+### ============ 主安装流程 ============
+
+install_all() {
+  require_root
+  install_curl
+  install_docker
+
+  echo "====================================================="
+  echo "      LogVar 弹幕 API · Docker 高级一键部署脚本"
+  echo "====================================================="
+  echo
+
+  # ==== 交互参数 ====
+  echo -e "${COLOR_CYAN}输入参数配置（回车使用方括号中的默认值）${COLOR_RESET}"
+
+  ensure_port
+  echo
+
+  read -rp "请输入普通访问 TOKEN [默认: 123987456]: " TOKEN
+  TOKEN="${TOKEN:-123987456}"
+
+  read -rp "请输入管理访问 ADMIN_TOKEN [默认: admin_888999]: " ADMIN_TOKEN
+  ADMIN_TOKEN="${ADMIN_TOKEN:-admin_888999}"
+
+  echo
+  echo "请选择弹幕颜色转换模式 (CONVERT_COLOR)："
+  echo "  1) default  - 不转换弹幕颜色"
+  echo "  2) white    - 将所有非白色弹幕转换为白色"
+  echo "  3) color    - 将所有白色弹幕转换为随机颜色（含白色，白色概率较高）"
+  local color_choice
+  while true; do
+    read -rp "请输入数字 [1-3，默认 3]: " color_choice
+    color_choice="${color_choice:-3}"
+    case "$color_choice" in
+      1) CONVERT_COLOR="default"; break ;;
+      2) CONVERT_COLOR="white";   break ;;
+      3) CONVERT_COLOR="color";   break ;;
+      *) warn "无效选择，请输入 1/2/3";;
+    esac
+  done
+
+  echo
+  local auto_update_choice
+  while true; do
+    read -rp "是否开启 Watchtower 自动更新（每天 04:00 检查新镜像）？[Y/n]: " auto_update_choice
+    auto_update_choice="${auto_update_choice:-Y}"
+    case "$auto_update_choice" in
+      [Yy]*) AUTO_UPDATE="1"; break ;;
+      [Nn]*) AUTO_UPDATE="0"; break ;;
+      *) warn "请输入 Y 或 N" ;;
+    esac
+  done
+
+  echo
+  echo "=============== 配置确认 ==============="
+  echo "  访问端口(Port):      ${PORT}"
+  echo "  TOKEN:              ${TOKEN}"
+  echo "  ADMIN_TOKEN:        ${ADMIN_TOKEN}"
+  echo "  CONVERT_COLOR:      ${CONVERT_COLOR}"
+  echo "  自动更新(AUTO_UPDATE): $( [ "$AUTO_UPDATE" = "1" ] && echo 已启用 || echo 已关闭 )"
+  echo "======================================="
+  read -rp "确认以上配置无误？[Y/n]: " confirm
+  confirm="${confirm:-Y}"
+  case "$confirm" in
+    [Yy]*) ;;
+    *) warn "用户取消安装"; exit 1 ;;
+  esac
+
+  # ==== 写入 .env ====
+  cat > .env.danmu-api <<EOF
+# danmu-api 部署配置备份（可用于 docker-compose 或迁移）
+PORT=${PORT}
+TOKEN=${TOKEN}
+ADMIN_TOKEN=${ADMIN_TOKEN}
+CONVERT_COLOR=${CONVERT_COLOR}
+AUTO_UPDATE=${AUTO_UPDATE}
+EOF
+
+  success "已生成配置文件 .env.danmu-api"
+
+  # ==== 生成 docker-compose 示例 ====
+  cat > docker-compose.danmu-api.yml <<EOF
+version: '3.8'
+
+services:
+  danmu-api:
+    image: logyar/danmu-api:latest
+    container_name: danmu-api
+    restart: unless-stopped
+    ports:
+      - "\${PORT:-8080}:8080"
+    environment:
+      - TOKEN=\${TOKEN}
+      - ADMIN_TOKEN=\${ADMIN_TOKEN}
+      - CONVERT_COLOR=\${CONVERT_COLOR}
+    healthcheck:
+      test: ["CMD-SHELL","curl -fs http://127.0.0.1:8080/\${TOKEN} || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+EOF
+
+  success "已生成 docker-compose.danmu-api.yml（仅示例，不会自动执行 compose）"
+
+  # ==== 停掉旧容器 ====
+  if docker ps -a --format '{{.Names}}' | grep -q '^danmu-api$'; then
+    info "发现已有 danmu-api 容器，先停止并删除..."
+    docker stop danmu-api >/dev/null 2>&1 || true
+    docker rm danmu-api >/dev/null 2>&1 || true
+  fi
+
+  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-danmu-api$'; then
+    info "发现已有 Watchtower 容器，先停止并删除..."
+    docker stop watchtower-danmu-api >/dev/null 2>&1 || true
+    docker rm watchtower-danmu-api >/dev/null 2>&1 || true
+  fi
+
+  # ==== 拉取镜像并启动容器 ====
+  info "拉取 danmu-api 最新镜像..."
+  docker pull logyar/danmu-api:latest
+
+  info "启动 danmu-api 容器..."
   docker run -d \
-    --name danmu-watchtower \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -e TZ=Asia/Shanghai \
-    -e WATCHTOWER_SCHEDULE="0 0 4 * * *" \
-    --restart always \
-    containrrr/watchtower danmu-api
-fi
+    --name danmu-api \
+    --restart unless-stopped \
+    -p "${PORT}:8080" \
+    -e "TOKEN=${TOKEN}" \
+    -e "ADMIN_TOKEN=${ADMIN_TOKEN}" \
+    -e "CONVERT_COLOR=${CONVERT_COLOR}" \
+    --health-cmd="curl -fs http://127.0.0.1:8080/${TOKEN} || exit 1" \
+    --health-interval=30s \
+    --health-timeout=5s \
+    --health-retries=3 \
+    logyar/danmu-api:latest >/dev/null
 
-#######################################
-# 5. 输出访问信息 & 管理指令
-#######################################
-IP_ADDR="$(detect_ip)"
+  success "danmu-api 容器已启动"
 
-echo
-print_line
-echo "  部署完成！弹幕 API 服务已经启动"
-print_line
-echo
-echo "  普通访问（TOKEN）地址："
-echo "    http://${IP_ADDR}:${PORT}/${TOKEN}"
-echo
-echo "  管理访问（ADMIN_TOKEN）地址："
-echo "    http://${IP_ADDR}:${PORT}/${ADMIN_TOKEN}"
-echo
-echo "  当前配置："
-echo "    端口(PORT)         : ${PORT}"
-echo "    TOKEN              : ${TOKEN}"
-echo "    ADMIN_TOKEN        : ${ADMIN_TOKEN}"
-echo "    CONVERT_COLOR      : ${CONVERT_COLOR}"
-if [[ "${AUTO_UPDATE}" == "y" ]]; then
-  echo "    自动更新           : 已启用（每日 04:00 通过 Watchtower 更新容器）"
-else
-  echo "    自动更新           : 未启用"
-fi
+  # ==== Watchtower 自动更新 ====
+  if [ "$AUTO_UPDATE" = "1" ]; then
+    info "启动 Watchtower（每天 04:00 检查 danmu-api 镜像更新）..."
+    docker run -d \
+      --name watchtower-danmu-api \
+      --restart unless-stopped \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      containrrr/watchtower \
+      --cleanup \
+      --schedule "0 0 4 * * *" \
+      danmu-api >/dev/null
+    success "Watchtower 已启动"
+  fi
 
-echo
-echo "  常用管理命令："
-echo "    查看运行中的容器： docker ps"
-echo "    查看实时日志：     docker logs -f danmu-api"
-echo "    重启服务：         docker restart danmu-api"
-echo "    停止服务：         docker stop danmu-api"
-echo "    删除服务：         docker rm -f danmu-api"
-if [[ "${AUTO_UPDATE}" == "y" ]]; then
-  echo "    查看更新日志：     docker logs -f danmu-watchtower"
-fi
+  # ==== 生成 README 使用说明 ====
+  local ipv4 ipv6
+  ipv4="$(detect_ipv4)"
+  ipv6="$(detect_ipv6)"
 
-print_line
-echo "如果服务器前有防火墙 / 安全组，请放行 TCP 端口：${PORT}"
-echo "如果你之后绑定域名，只需将域名解析到该服务器 IP 即可使用。"
-print_line
-echo
+  cat > README_danmu-api.txt <<EOF
+LogVar 弹幕 API 部署成功说明
+================================
+
+一、访问地址
+-----------------------------
+
+普通访问（TOKEN）：
+  IPv4: http://${ipv4:-你的服务器IP}:${PORT}/${TOKEN}
+EOF
+
+  if [ -n "$ipv6" ]; then
+    cat >> README_danmu-api.txt <<EOF
+  IPv6: http://[${ipv6}]:${PORT}/${TOKEN}
+EOF
+  fi
+
+  cat >> README_danmu-api.txt <<EOF
+
+管理访问（ADMIN_TOKEN）：
+  IPv4: http://${ipv4:-你的服务器IP}:${PORT}/${ADMIN_TOKEN}
+EOF
+
+  if [ -n "$ipv6" ]; then
+    cat >> README_danmu-api.txt <<EOF
+  IPv6: http://[${ipv6}]:${PORT}/${ADMIN_TOKEN}
+EOF
+  fi
+
+  cat >> README_danmu-api.txt <<'EOF'
+
+二、常用 Docker 命令
+-----------------------------
+
+查看容器：
+  docker ps
+
+查看日志：
+  docker logs -f danmu-api
+
+重启服务：
+  docker restart danmu-api
+
+停止服务：
+  docker stop danmu-api
+
+如果启用了自动更新（Watchtower），相关命令：
+  查看日志：
+    docker logs -f watchtower-danmu-api
+
+  停止自动更新：
+    docker stop watchtower-danmu-api && docker rm watchtower-danmu-api
+
+
+三、配置文件说明
+-----------------------------
+
+1) .env.danmu-api
+   - 记录了当前使用的 PORT / TOKEN / ADMIN_TOKEN / CONVERT_COLOR / AUTO_UPDATE
+   - 方便后续迁移、备份、或使用 docker-compose 管理
+
+2) docker-compose.danmu-api.yml
+   - 一个可选的 docker-compose 示例文件
+   - 如需使用：
+       export $(grep -v '^#' .env.danmu-api | xargs)
+       docker compose -f docker-compose.danmu-api.yml up -d
+
+四、安全加固建议（可选）
+-----------------------------
+
+1) 如需给管理端再加一层 Basic Auth：
+   - 建议在服务器上再部署 Nginx / Caddy 等反向代理
+   - 仅对 /${ADMIN_TOKEN} 这个路径启用 Basic Auth
+   - 反向代理再转发到本机的 http://127.0.0.1:${PORT}/${ADMIN_TOKEN}
+
+2) 如需 HTTPS：
+   - 准备一个域名解析到本服务器
+   - 在反向代理（Nginx / Caddy / Nginx Proxy Manager 等）上签发证书
+   - 再把域名访问转发到本机 http://127.0.0.1:${PORT}
+
+EOF
+
+  success "已生成 README_danmu-api.txt 使用说明"
+
+  # ==== 最终信息输出 ====
+  ipv4="$(detect_ipv4)"
+
+  echo
+  echo "=============================================================="
+  echo "                      部署完成！"
+  echo "=============================================================="
+  echo
+  echo -e "${COLOR_GREEN}普通访问（TOKEN）地址：${COLOR_RESET}"
+  echo "  http://${ipv4:-你的服务器IP}:${PORT}/${TOKEN}"
+  echo
+  echo -e "${COLOR_GREEN}管理访问（ADMIN_TOKEN）地址：${COLOR_RESET}"
+  echo "  http://${ipv4:-你的服务器IP}:${PORT}/${ADMIN_TOKEN}"
+  echo
+  echo "当前配置："
+  echo "  PORT           = ${PORT}"
+  echo "  TOKEN          = ${TOKEN}"
+  echo "  ADMIN_TOKEN    = ${ADMIN_TOKEN}"
+  echo "  CONVERT_COLOR  = ${CONVERT_COLOR}"
+  echo "  AUTO_UPDATE    = ${AUTO_UPDATE}  ($( [ "$AUTO_UPDATE" = "1" ] && echo 已启用 || echo 已关闭 ))"
+  echo
+  echo "常用命令："
+  echo "  查看状态：   docker ps"
+  echo "  查看日志：   docker logs -f danmu-api"
+  echo "  重启服务：   docker restart danmu-api"
+  echo "  停止服务：   docker stop danmu-api"
+  if [ "$AUTO_UPDATE" = "1" ]; then
+    echo "  查看更新日志：docker logs -f watchtower-danmu-api"
+  fi
+  echo
+  echo "配置/说明文件："
+  echo "  .env.danmu-api"
+  echo "  docker-compose.danmu-api.yml"
+  echo "  README_danmu-api.txt"
+  echo
+  echo "如需卸载 / 清理：bash $(basename "$0") uninstall"
+  echo "=============================================================="
+}
+
+### ============ 主入口 ============
+
+case "$1" in
+  uninstall)
+    uninstall_all
+    ;;
+  status)
+    show_status
+    ;;
+  *)
+    install_all
+    ;;
+esac
