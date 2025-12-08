@@ -21,8 +21,8 @@ DEFAULT_VOD_RETURN_MODE="fastest"
 DEFAULT_VOD_REQUEST_TIMEOUT="10000"
 DEFAULT_YOUKU_CONCURRENCY="8"
 
-# 镜像名称（如你有本地镜像，可改成 danmu-local:latest）
-IMAGE_NAME="logyar/danmu-api:latest"
+# 镜像名称（注意：是 dannu-api，不是 danmu-api）
+IMAGE_NAME="logyar/dannu-api:latest"
 
 ### ============ 彩色输出 ============
 
@@ -77,7 +77,7 @@ install_docker() {
     chmod a+r /etc/apt/keyrings/docker.gpg
   fi
 
-  # 关键修复：自动判断 debian / ubuntu
+  # 自动判断 debian / ubuntu，修掉 ubuntu bookworm 的问题
   . /etc/os-release
   case "$ID" in
     debian)
@@ -88,7 +88,7 @@ install_docker() {
       ;;
     *)
       docker_distro="ubuntu"
-      warn "未知系统 ID=${ID}，将按 ubuntu 源配置 Docker（如有问题请手动修改 /etc/apt/sources.list.d/docker.list）"
+      warn "未知系统 ID=${ID}，按 ubuntu 源配置 Docker，如有问题请手动修改 /etc/apt/sources.list.d/docker.list"
       ;;
   esac
 
@@ -148,16 +148,16 @@ ensure_port() {
 
 uninstall_all() {
   require_root
-  info "卸载 danmu-api 及相关容器..."
+  info "卸载 dannu-api 及相关容器..."
 
-  if docker ps -a --format '{{.Names}}' | grep -q '^danmu-api$'; then
-    docker stop danmu-api >/dev/null 2>&1 || true
-    docker rm danmu-api >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -q '^dannu-api$'; then
+    docker stop dannu-api >/dev/null 2>&1 || true
+    docker rm dannu-api >/dev/null 2>&1 || true
   fi
 
-  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-danmu-api$'; then
-    docker stop watchtower-danmu-api >/dev/null 2>&1 || true
-    docker rm watchtower-danmu-api >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-dannu-api$'; then
+    docker stop watchtower-dannu-api >/dev/null 2>&1 || true
+    docker rm watchtower-dannu-api >/dev/null 2>&1 || true
   fi
 
   rm -f .env.danmu-api docker-compose.danmu-api.yml README_danmu-api.txt
@@ -171,7 +171,7 @@ show_status() {
   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
     | sed 's/^/  /'
   echo
-  info "查看日志：docker logs -f danmu-api"
+  info "查看日志：docker logs -f dannu-api"
   exit 0
 }
 
@@ -263,7 +263,7 @@ install_all() {
     *) warn "用户取消安装"; exit 1 ;;
   esac
 
-  # 备份配置
+  # 备份配置（文件名还是沿用 danmu-api，和你的仓库名对应）
   cat > .env.danmu-api <<EOF
 PORT=${PORT}
 TOKEN=${TOKEN}
@@ -288,7 +288,7 @@ version: '3.8'
 services:
   danmu-api:
     image: ${IMAGE_NAME}
-    container_name: danmu-api
+    container_name: dannu-api
     restart: unless-stopped
     ports:
       - "\${PORT:-8080}:9321"
@@ -309,22 +309,22 @@ EOF
   success "已生成 docker-compose.danmu-api.yml 示例"
 
   # 删除旧容器
-  if docker ps -a --format '{{.Names}}' | grep -q '^danmu-api$'; then
-    docker stop danmu-api >/dev/null 2>&1 || true
-    docker rm danmu-api >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -q '^dannu-api$'; then
+    docker stop dannu-api >/dev/null 2>&1 || true
+    docker rm dannu-api >/dev/null 2>&1 || true
   fi
-  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-danmu-api$'; then
-    docker stop watchtower-danmu-api >/dev/null 2>&1 || true
-    docker rm watchtower-danmu-api >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-dannu-api$'; then
+    docker stop watchtower-dannu-api >/dev/null 2>&1 || true
+    docker rm watchtower-dannu-api >/dev/null 2>&1 || true
   fi
 
   # 拉镜像 + 启动
   info "拉取镜像 ${IMAGE_NAME}..."
   docker pull "${IMAGE_NAME}" || warn "拉取失败将使用本地镜像（如果存在）"
 
-  info "启动 danmu-api 容器..."
+  info "启动 dannu-api 容器..."
   docker run -d \
-    --name danmu-api \
+    --name dannu-api \
     --restart unless-stopped \
     -p "${PORT}:9321" \
     -v "${DANMU_ENV_FILE}:/app/.env" \
@@ -340,19 +340,19 @@ EOF
     -e "BILIBILI_COOKIE=${BILIBILI_COOKIE}" \
     "${IMAGE_NAME}" >/dev/null
 
-  success "danmu-api 容器已启动"
+  success "dannu-api 容器已启动"
 
   # 自动更新
   if [ "$AUTO_UPDATE" = "1" ]; then
     info "启动 Watchtower 自动更新..."
     docker run -d \
-      --name watchtower-danmu-api \
+      --name watchtower-dannu-api \
       --restart unless-stopped \
       -v /var/run/docker.sock:/var/run/docker.sock \
       containrrr/watchtower \
       --cleanup \
       --schedule "0 0 4 * * *" \
-      danmu-api >/dev/null
+      dannu-api >/dev/null
     success "Watchtower 已启动"
   fi
 
@@ -375,13 +375,13 @@ LogVar 弹幕 API 部署成功说明
   docker ps
 
 查看日志：
-  docker logs -f danmu-api
+  docker logs -f dannu-api
 
 重启服务：
-  docker restart danmu-api
+  docker restart dannu-api
 
 停止服务：
-  docker stop danmu-api
+  docker stop dannu-api
 
 卸载脚本：
   bash $(basename "$0") uninstall
@@ -398,8 +398,8 @@ EOF
   echo "================== 部署完成 =================="
   echo "普通访问： http://${ipv4:-你的服务器IP}:${PORT}/${TOKEN}"
   echo "管理访问： http://${ipv4:-你的服务器IP}:${PORT}/${ADMIN_TOKEN}"
-  echo "查看日志： docker logs -f danmu-api"
-  [ "$AUTO_UPDATE" = "1" ] && echo "自动更新： 已启用（watchtower-danmu-api）" || echo "自动更新： 已关闭"
+  echo "查看日志： docker logs -f dannu-api"
+  [ "$AUTO_UPDATE" = "1" ] && echo "自动更新： 已启用（watchtower-dannu-api）" || echo "自动更新： 已关闭"
   echo "=============================================="
 }
 
