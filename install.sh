@@ -21,7 +21,7 @@ DEFAULT_VOD_RETURN_MODE="fastest"
 DEFAULT_VOD_REQUEST_TIMEOUT="10000"
 DEFAULT_YOUKU_CONCURRENCY="8"
 
-# 镜像名称（注意：这里用的是你老命令里的 logvar/danmu-api）
+# 镜像名称（注意：这里用的是你以前那条命令里的 logvar/danmu-api）
 IMAGE_NAME="logvar/danmu-api:latest"
 
 ### ============ 彩色输出 ============
@@ -152,7 +152,13 @@ uninstall_all() {
   info "卸载 danmu-api 相关容器..."
 
   # 统一清理所有可能的旧容器（包括你以前叫 watchtower 的）
-  for name in danmu-api dannu-api watchtower-danmu-api watchtower-dannu-api watchtower; do
+  for name in \
+    danmu-api \
+    dannu-api \
+    watchtower \
+    watchtower-danmu-api \
+    watchtower-dannu-api \
+    danmu-watchtower; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
       info "停止并删除容器 ${name}..."
       docker stop "$name" >/dev/null 2>&1 || true
@@ -194,7 +200,13 @@ install_all() {
 
   # 0. 安装前统一清理旧容器（不问直接删）
   info "检查并清理已有旧容器（如有）..."
-  for name in danmu-api dannu-api watchtower-danmu-api watchtower-dannu-api watchtower; do
+  for name in \
+    danmu-api \
+    dannu-api \
+    watchtower \
+    watchtower-danmu-api \
+    watchtower-dannu-api \
+    danmu-watchtower; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
       info "发现旧容器 ${name}，正在停止并删除..."
       docker stop "$name" >/dev/null 2>&1 || true
@@ -343,18 +355,19 @@ EOF
 
   success "danmu-api 容器已启动"
 
-  # 自动更新
+  # 自动更新：每天凌晨 4 点（Asia/Shanghai）
   if [ "$AUTO_UPDATE" = "1" ]; then
     info "启动 Watchtower 自动更新..."
     docker run -d \
       --name watchtower-danmu-api \
-      --restart unless-stopped \
       -v /var/run/docker.sock:/var/run/docker.sock \
+      --restart always \
+      -e DOCKER_API_VERSION=1.44 \
+      -e TZ=Asia/Shanghai \
+      -e WATCHTOWER_SCHEDULE="0 0 4 * * *" \
       containrrr/watchtower \
-      --cleanup \
-      --schedule "0 0 4 * * *" \
       danmu-api >/dev/null
-    success "Watchtower 已启动"
+    success "Watchtower 已启动（每天凌晨 4 点自动检查 danmu-api 更新）"
   fi
 
   # README 提示
@@ -400,7 +413,7 @@ EOF
   echo "普通访问： http://${ipv4:-你的服务器IP}:${PORT}/${TOKEN}"
   echo "管理访问： http://${ipv4:-你的服务器IP}:${PORT}/${ADMIN_TOKEN}"
   echo "查看日志： docker logs -f danmu-api"
-  [ "$AUTO_UPDATE" = "1" ] && echo "自动更新： 已启用（watchtower-danmu-api）" || echo "自动更新： 已关闭"
+  [ "$AUTO_UPDATE" = "1" ] && echo "自动更新： 已启用（watchtower-danmu-api，每天 4 点）" || echo "自动更新： 已关闭"
   echo "=============================================="
 }
 
