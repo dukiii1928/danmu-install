@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LogVar 弹幕 API · Docker 一键部署脚本（仅询问关键变量）
+# LogVar 弹幕 API · Docker 一键部署脚本
 # 用法：
 #   安装/更新：bash install.sh
 #   卸载：    bash install.sh uninstall
@@ -7,13 +7,13 @@
 
 set -e
 
-### ============ 默认配置（不再交互） ============
+#################### 基本默认配置 ####################
 
-# 持久化 .env 的目录与文件（挂载到 /app/.env）
+# 持久化 .env 的目录 / 文件（挂载到 /app/.env）
 DANMU_ENV_DIR="/root/danmu-config"
 DANMU_ENV_FILE="${DANMU_ENV_DIR}/.env"
 
-# 默认视频源 & 采集配置（与你后台一致）
+# 默认 VOD 相关配置（与后台默认一致）
 DEFAULT_SOURCE_ORDER="360,vod,douban,tencent,youku,iqiyi,imgo,bilibili,renren,hanjutv,bahamut,dandan"
 DEFAULT_OTHER_SERVER="https://api.danmu.icu"
 DEFAULT_VOD_SERVERS="zy@https://zy.jinchancaiji.com,789@https://www.caiji.cyou,听风@https://gctf.tfdh.top"
@@ -21,10 +21,10 @@ DEFAULT_VOD_RETURN_MODE="fastest"
 DEFAULT_VOD_REQUEST_TIMEOUT="10000"
 DEFAULT_YOUKU_CONCURRENCY="8"
 
-# 镜像名称（注意：这里用的是你以前那条命令里的 logvar/danmu-api）
+# 主镜像
 IMAGE_NAME="logvar/danmu-api:latest"
 
-### ============ 彩色输出 ============
+#################### 彩色输出 ####################
 
 COLOR_RESET="\e[0m"
 COLOR_GREEN="\e[32m"
@@ -37,7 +37,7 @@ success() { echo -e "${COLOR_GREEN}[OK]  ${COLOR_RESET} $*"; }
 warn()    { echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"; }
 error()   { echo -e "${COLOR_RED}[ERR] ${COLOR_RESET} $*"; }
 
-### ============ 基本检查 ============
+#################### 基础检查 ####################
 
 require_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -77,19 +77,13 @@ install_docker() {
     chmod a+r /etc/apt/keyrings/docker.gpg
   fi
 
-  # 自动判断 debian / ubuntu，避免 ubuntu bookworm 错误
   . /etc/os-release
   case "$ID" in
-    debian)
-      docker_distro="debian"
-      ;;
-    ubuntu)
-      docker_distro="ubuntu"
-      ;;
-    *)
-      docker_distro="ubuntu"
-      warn "未知系统 ID=${ID}，按 ubuntu 源配置 Docker，如有问题请手动修改 /etc/apt/sources.list.d/docker.list"
-      ;;
+    debian) docker_distro="debian" ;;
+    ubuntu) docker_distro="ubuntu" ;;
+    *) docker_distro="ubuntu"
+       warn "未知系统 ID=${ID}，按 ubuntu 源配置 Docker，如有问题请手动修改 /etc/apt/sources.list.d/docker.list"
+       ;;
   esac
 
   codename="${VERSION_CODENAME}"
@@ -112,12 +106,7 @@ detect_ipv4() {
   hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-detect_ipv6() {
-  curl -6 -fsS ifconfig.co 2>/dev/null || \
-  curl -6 -fsS icanhazip.com 2>/dev/null || true
-}
-
-### ============ 端口交互 ============
+#################### 端口交互 ####################
 
 ensure_port() {
   local port
@@ -145,13 +134,12 @@ ensure_port() {
   done
 }
 
-### ============ 卸载 & 状态 ============
+#################### 卸载 & 状态 ####################
 
 uninstall_all() {
   require_root
   info "卸载 danmu-api 相关容器..."
 
-  # 统一清理所有可能的旧容器（包括你以前叫 watchtower 的）
   for name in \
     danmu-api \
     dannu-api \
@@ -167,7 +155,7 @@ uninstall_all() {
   done
 
   rm -f .env.danmu-api docker-compose.danmu-api.yml README_danmu-api.txt
-
+  # 是否删除持久化 .env 根据自己需求，这里保留方便下次用
   success "卸载完成"
   exit 0
 }
@@ -181,7 +169,7 @@ show_status() {
   exit 0
 }
 
-### ============ 主安装流程 ============
+#################### 主安装流程 ####################
 
 install_all() {
   require_root
@@ -198,7 +186,7 @@ install_all() {
   echo -e "${COLOR_CYAN}只会询问：端口 / TOKEN / ADMIN_TOKEN / 自动更新 / CONVERT_COLOR / BILIBILI_COOKIE${COLOR_RESET}"
   echo
 
-  # 0. 安装前统一清理旧容器（不问直接删）
+  # 0. 清理旧容器
   info "检查并清理已有旧容器（如有）..."
   for name in \
     danmu-api \
@@ -262,7 +250,7 @@ install_all() {
   # 6. B 站 Cookie
   read -rp "请输入 BILIBILI_COOKIE（可留空，直接粘贴整串 Cookie）: " BILIBILI_COOKIE
 
-  # 其余全部使用默认值
+  # 其他全部使用默认值
   SOURCE_ORDER="${DEFAULT_SOURCE_ORDER}"
   OTHER_SERVER="${DEFAULT_OTHER_SERVER}"
   VOD_SERVERS="${DEFAULT_VOD_SERVERS}"
@@ -286,7 +274,9 @@ install_all() {
     *) warn "用户取消安装"; exit 1 ;;
   esac
 
-  # 备份配置
+  ######## 写入备份 & .env（重点） ########
+
+  # 1）备份一份完整配置，方便以后查看
   cat > .env.danmu-api <<EOF
 PORT=${PORT}
 TOKEN=${TOKEN}
@@ -304,7 +294,23 @@ DANMU_ENV_FILE=${DANMU_ENV_FILE}
 EOF
   success "已生成配置备份 .env.danmu-api"
 
-  # docker-compose 示例（不自动执行）
+  # 2）生成运行时 .env（容器 /app/.env 实际读取的就是这个）
+  cat > "${DANMU_ENV_FILE}" <<EOF
+TOKEN=${TOKEN}
+ADMIN_TOKEN=${ADMIN_TOKEN}
+CONVERT_COLOR=${CONVERT_COLOR}
+SOURCE_ORDER=${SOURCE_ORDER}
+OTHER_SERVER=${OTHER_SERVER}
+VOD_SERVERS=${VOD_SERVERS}
+VOD_RETURN_MODE=${VOD_RETURN_MODE}
+VOD_REQUEST_TIMEOUT=${VOD_REQUEST_TIMEOUT}
+YOUKU_CONCURRENCY=${YOUKU_CONCURRENCY}
+BILIBILI_COOKIE=${BILIBILI_COOKIE}
+EOF
+  success "已生成运行时 .env 文件：${DANMU_ENV_FILE}"
+
+  ######## docker-compose 示例 ########
+
   cat > docker-compose.danmu-api.yml <<EOF
 version: '3.8'
 
@@ -331,7 +337,8 @@ services:
 EOF
   success "已生成 docker-compose.danmu-api.yml 示例"
 
-  # 拉镜像 + 启动
+  ######## 拉镜像 + 启动容器 ########
+
   info "拉取镜像 ${IMAGE_NAME}..."
   docker pull "${IMAGE_NAME}" || warn "拉取失败，将尝试使用本地已有镜像（如果存在）"
 
@@ -370,10 +377,10 @@ EOF
     success "Watchtower 已启动（每天凌晨 4 点自动检查 danmu-api 更新）"
   fi
 
-  # README 提示
-  local ipv4 ipv6
+  ######## 生成 README 提示 ########
+
+  local ipv4
   ipv4="$(detect_ipv4)"
-  ipv6="$(detect_ipv6)"
 
   cat > README_danmu-api.txt <<EOF
 LogVar 弹幕 API 部署成功说明
@@ -400,10 +407,8 @@ LogVar 弹幕 API 部署成功说明
 卸载：
   bash $(basename "$0") uninstall
 
-配置文件：
-  .env.danmu-api
-  docker-compose.danmu-api.yml
-  运行时 .env：${DANMU_ENV_FILE}
+运行时 .env：
+  ${DANMU_ENV_FILE}
 EOF
 
   success "已生成 README_danmu-api.txt"
@@ -417,7 +422,7 @@ EOF
   echo "=============================================="
 }
 
-### ============ 主入口 ============
+#################### 主入口 ####################
 
 case "$1" in
   uninstall)
