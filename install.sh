@@ -21,8 +21,8 @@ DEFAULT_VOD_RETURN_MODE="fastest"
 DEFAULT_VOD_REQUEST_TIMEOUT="10000"
 DEFAULT_YOUKU_CONCURRENCY="8"
 
-# 镜像名称（注意：这里用的是正确存在的 danmu-api 镜像）
-IMAGE_NAME="logyar/danmu-api:latest"
+# 镜像名称（注意：这里用的是你老命令里的 logvar/danmu-api）
+IMAGE_NAME="logvar/danmu-api:latest"
 
 ### ============ 彩色输出 ============
 
@@ -108,7 +108,7 @@ EOF
 
 detect_ipv4() {
   curl -4 -fsS ifconfig.co 2>/dev/null || \
-  curl -4 -fsS icanhazip.com 2>/null || \
+  curl -4 -fsS icanhazip.com 2>/dev/null || \
   hostname -I 2>/dev/null | awk '{print $1}'
 }
 
@@ -151,8 +151,8 @@ uninstall_all() {
   require_root
   info "卸载 danmu-api 相关容器..."
 
-  # 统一清理所有可能的旧容器
-  for name in danmu-api dannu-api watchtower-danmu-api watchtower-dannu-api; do
+  # 统一清理所有可能的旧容器（包括你以前叫 watchtower 的）
+  for name in danmu-api dannu-api watchtower-danmu-api watchtower-dannu-api watchtower; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
       info "停止并删除容器 ${name}..."
       docker stop "$name" >/dev/null 2>&1 || true
@@ -194,7 +194,7 @@ install_all() {
 
   # 0. 安装前统一清理旧容器（不问直接删）
   info "检查并清理已有旧容器（如有）..."
-  for name in danmu-api dannu-api watchtower-danmu-api watchtower-dannu-api; do
+  for name in danmu-api dannu-api watchtower-danmu-api watchtower-dannu-api watchtower; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
       info "发现旧容器 ${name}，正在停止并删除..."
       docker stop "$name" >/dev/null 2>&1 || true
@@ -274,7 +274,7 @@ install_all() {
     *) warn "用户取消安装"; exit 1 ;;
   esac
 
-  # 备份配置（文件名沿用 danmu-api，和仓库名对应）
+  # 备份配置
   cat > .env.danmu-api <<EOF
 PORT=${PORT}
 TOKEN=${TOKEN}
@@ -292,7 +292,7 @@ DANMU_ENV_FILE=${DANMU_ENV_FILE}
 EOF
   success "已生成配置备份 .env.danmu-api"
 
-  # compose 示例（不自动执行）
+  # docker-compose 示例（不自动执行）
   cat > docker-compose.danmu-api.yml <<EOF
 version: '3.8'
 
@@ -357,7 +357,7 @@ EOF
     success "Watchtower 已启动"
   fi
 
-  # README
+  # README 提示
   local ipv4 ipv6
   ipv4="$(detect_ipv4)"
   ipv6="$(detect_ipv6)"
@@ -384,7 +384,7 @@ LogVar 弹幕 API 部署成功说明
 停止服务：
   docker stop danmu-api
 
-卸载脚本：
+卸载：
   bash $(basename "$0") uninstall
 
 配置文件：
