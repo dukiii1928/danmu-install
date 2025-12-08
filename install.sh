@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LogVar 弹幕 API · Docker 高级一键部署脚本（仅询问关键变量）
+# LogVar 弹幕 API · Docker 一键部署脚本（仅询问关键变量）
 # 用法：
 #   安装/更新：bash install.sh
 #   卸载：    bash install.sh uninstall
@@ -13,7 +13,7 @@ set -e
 DANMU_ENV_DIR="/root/danmu-config"
 DANMU_ENV_FILE="${DANMU_ENV_DIR}/.env"
 
-# 默认视频源 & 采集配置（与你后台截图一致）
+# 默认视频源 & 采集配置（与你后台一致）
 DEFAULT_SOURCE_ORDER="360,vod,douban,tencent,youku,iqiyi,imgo,bilibili,renren,hanjutv,bahamut,dandan"
 DEFAULT_OTHER_SERVER="https://api.danmu.icu"
 DEFAULT_VOD_SERVERS="zy@https://zy.jinchancaiji.com,789@https://www.caiji.cyou,听风@https://gctf.tfdh.top"
@@ -66,6 +66,7 @@ install_docker() {
   fi
 
   info "安装 Docker..."
+
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release
 
@@ -76,12 +77,26 @@ install_docker() {
     chmod a+r /etc/apt/keyrings/docker.gpg
   fi
 
-  local codename
-  codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+  # 关键修复：自动判断 debian / ubuntu
+  . /etc/os-release
+  case "$ID" in
+    debian)
+      docker_distro="debian"
+      ;;
+    ubuntu)
+      docker_distro="ubuntu"
+      ;;
+    *)
+      docker_distro="ubuntu"
+      warn "未知系统 ID=${ID}，将按 ubuntu 源配置 Docker（如有问题请手动修改 /etc/apt/sources.list.d/docker.list）"
+      ;;
+  esac
 
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-    ${codename} stable" > /etc/apt/sources.list.d/docker.list
+  codename="${VERSION_CODENAME}"
+
+  cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${docker_distro} ${codename} stable
+EOF
 
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io
@@ -146,6 +161,7 @@ uninstall_all() {
   fi
 
   rm -f .env.danmu-api docker-compose.danmu-api.yml README_danmu-api.txt
+
   success "卸载完成"
   exit 0
 }
@@ -173,8 +189,7 @@ install_all() {
   echo "      LogVar 弹幕 API · Docker 一键部署脚本"
   echo "====================================================="
   echo
-
-  echo -e "${COLOR_CYAN}只会询问以下几项：端口 / TOKEN / ADMIN_TOKEN / 自动更新 / 弹幕颜色 / B 站 Cookie${COLOR_RESET}"
+  echo -e "${COLOR_CYAN}只会询问：端口 / TOKEN / ADMIN_TOKEN / 自动更新 / CONVERT_COLOR / BILIBILI_COOKIE${COLOR_RESET}"
   echo
 
   # 1. 端口
@@ -239,14 +254,7 @@ install_all() {
   echo "  ADMIN_TOKEN:          ${ADMIN_TOKEN}"
   echo "  CONVERT_COLOR:        ${CONVERT_COLOR}"
   echo "  自动更新(AUTO_UPDATE): $( [ "$AUTO_UPDATE" = "1" ] && echo 已启用 || echo 已关闭 )"
-  echo "  SOURCE_ORDER:         ${SOURCE_ORDER}"
-  echo "  OTHER_SERVER:         ${OTHER_SERVER}"
-  echo "  VOD_SERVERS:          ${VOD_SERVERS}"
-  echo "  VOD_RETURN_MODE:      ${VOD_RETURN_MODE}"
-  echo "  VOD_REQUEST_TIMEOUT:  ${VOD_REQUEST_TIMEOUT}"
-  echo "  YOUKU_CONCURRENCY:    ${YOUKU_CONCURRENCY}"
   [ -n "$BILIBILI_COOKIE" ] && echo "  BILIBILI_COOKIE:      (已设置，长度 ${#BILIBILI_COOKIE})" || echo "  BILIBILI_COOKIE:      未设置"
-  echo "  挂载配置文件:         ${DANMU_ENV_FILE} -> /app/.env"
   echo "======================================="
   read -rp "确认以上配置无误？[Y/n]: " confirm
   confirm="${confirm:-Y}"
