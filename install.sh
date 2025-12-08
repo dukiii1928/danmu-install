@@ -150,15 +150,14 @@ uninstall_all() {
   require_root
   info "卸载 dannu-api 及相关容器..."
 
-  if docker ps -a --format '{{.Names}}' | grep -q '^dannu-api$'; then
-    docker stop dannu-api >/dev/null 2>&1 || true
-    docker rm dannu-api >/dev/null 2>&1 || true
-  fi
-
-  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-dannu-api$'; then
-    docker stop watchtower-dannu-api >/dev/null 2>&1 || true
-    docker rm watchtower-dannu-api >/dev/null 2>&1 || true
-  fi
+  # 统一清理所有可能的旧容器
+  for name in dannu-api danmu-api watchtower-dannu-api watchtower-danmu-api; do
+    if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
+      info "停止并删除容器 ${name}..."
+      docker stop "$name" >/dev/null 2>&1 || true
+      docker rm "$name" >/dev/null 2>&1 || true
+    fi
+  done
 
   rm -f .env.danmu-api docker-compose.danmu-api.yml README_danmu-api.txt
 
@@ -191,6 +190,17 @@ install_all() {
   echo
   echo -e "${COLOR_CYAN}只会询问：端口 / TOKEN / ADMIN_TOKEN / 自动更新 / CONVERT_COLOR / BILIBILI_COOKIE${COLOR_RESET}"
   echo
+
+  # 0. 安装前统一清理旧容器（不问直接删）
+  info "检查并清理已有旧容器（如有）..."
+  for name in dannu-api danmu-api watchtower-dannu-api watchtower-danmu-api; do
+    if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
+      info "发现旧容器 ${name}，正在停止并删除..."
+      docker stop "$name" >/dev/null 2>&1 || true
+      docker rm "$name" >/dev/null 2>&1 || true
+    fi
+  done
+  success "旧容器清理完成"
 
   # 1. 端口
   ensure_port
@@ -307,16 +317,6 @@ services:
       - "${DANMU_ENV_FILE}:/app/.env"
 EOF
   success "已生成 docker-compose.danmu-api.yml 示例"
-
-  # 删除旧容器
-  if docker ps -a --format '{{.Names}}' | grep -q '^dannu-api$'; then
-    docker stop dannu-api >/dev/null 2>&1 || true
-    docker rm dannu-api >/dev/null 2>&1 || true
-  fi
-  if docker ps -a --format '{{.Names}}' | grep -q '^watchtower-dannu-api$'; then
-    docker stop watchtower-dannu-api >/dev/null 2>&1 || true
-    docker rm watchtower-dannu-api >/dev/null 2>&1 || true
-  fi
 
   # 拉镜像 + 启动
   info "拉取镜像 ${IMAGE_NAME}..."
