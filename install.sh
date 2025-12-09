@@ -9,7 +9,7 @@ set -e
 
 #################### 基本默认配置 ####################
 
-# 持久化 .env 的目录 / 文件（挂载到容器 /config/app/config/.env，兼容 1.9.2+ 新配置目录）
+# 持久化 .env 的目录 / 文件（挂载到容器 /app/config/.env，兼容 1.9.2+ 新配置目录）
 DANMU_ENV_DIR="/root/danmu-config"
 DANMU_ENV_FILE="${DANMU_ENV_DIR}/.env"
 
@@ -294,7 +294,7 @@ DANMU_ENV_FILE=${DANMU_ENV_FILE}
 EOF
   success "已生成配置备份 .env.danmu-api"
 
-  # 2）生成运行时 .env（容器 /config/app/config/.env 实际读取的就是这个，1.9.2+）
+  # 2）生成运行时 .env（容器 /app/config/.env 实际读取的就是这个，1.9.2+）
   cat > "${DANMU_ENV_FILE}" <<EOF
 TOKEN=${TOKEN}
 ADMIN_TOKEN=${ADMIN_TOKEN}
@@ -333,7 +333,7 @@ services:
       - YOUKU_CONCURRENCY=\${YOUKU_CONCURRENCY}
       - BILIBILI_COOKIE=\${BILIBILI_COOKIE}
     volumes:
-      - "${DANMU_ENV_DIR}:/config/app/config"
+      - "${DANMU_ENV_DIR}:/app/config"
 EOF
   success "已生成 docker-compose.danmu-api.yml 示例"
 
@@ -347,7 +347,7 @@ EOF
     --name danmu-api \
     --restart unless-stopped \
     -p "${PORT}:9321" \
-    -v "${DANMU_ENV_DIR}:/config/app/config" \
+    -v "${DANMU_ENV_DIR}:/app/config" \
     -e "TOKEN=${TOKEN}" \
     -e "ADMIN_TOKEN=${ADMIN_TOKEN}" \
     -e "CONVERT_COLOR=${CONVERT_COLOR}" \
