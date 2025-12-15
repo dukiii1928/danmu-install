@@ -1,367 +1,167 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-# Danmu 一键安装（Docker + Nginx 反代 + 可选 Cloudflare DNS + 可选 HTTPS）
-# Debian/Ubuntu 适配。输出 /root/danmu-info.txt
+set -euo pipefail
 
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"; NC="\033[0m"
-log(){ echo -e "${CYAN}[INFO]${NC} $*"; }
-ok(){ echo -e "${GREEN}[OK]${NC} $*"; }
-warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
-err(){ echo -e "${RED}[ERR]${NC} $*" >&2; }
+APP_DIR="/opt/danmu-api"
+CONTAINER_NAME="danmu-api"
+IMAGE="logvar/danmu-api:latest"
 
-has(){ command -v "$1" >/dev/null 2>&1; }
+DEFAULT_PORT="9321"
+DEFAULT_TOKEN="87654321"
 
-need_root(){ [[ ${EUID:-1} -eq 0 ]] || { err "请用 root 运行"; exit 1; }; }
+DEFAULT_SOURCE_ORDER="360,vod,douban,tencent,youku,iqiyi,imgo,bilibili,renren,hanjutv,bahamut,dandan"
+DEFAULT_OTHER_SERVER="https://api.danmu.icu"
+DEFAULT_VOD_SERVERS="zy@https://zy.jinchancaiji.com,789@https://www.caiji.cyou,听风@https://gctf.tfdh.top"
+DEFAULT_VOD_RETURN_MODE="fastest"
+DEFAULT_VOD_REQUEST_TIMEOUT="10000"
+DEFAULT_YOUKU_CONCURRENCY="8"
 
-prompt(){
-  local __var="$1" __msg="$2" __def="${3:-}" __val=""
-  if [[ -n "$__def" ]]; then
-    read -r -p "$__msg (默认: $__def): " __val || true
-    __val="${__val:-$__def}"
+CONFIG_DIR="${APP_DIR}/config"
+CACHE_DIR="${APP_DIR}/.cache"
+COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
+ENV_FILE="${CONFIG_DIR}/.env"
+CRON_FILE="/etc/cron.d/danmu-api-autoupdate"
+
+log(){ echo "[INFO] $*"; }
+die(){ echo "[ERROR] $*" >&2; exit 1; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
+
+compose_cmd(){
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    echo "docker-compose"
   else
-    read -r -p "$__msg: " __val || true
-  fi
-  printf -v "$__var" "%s" "$__val"
-}
-prompt_yn(){
-  local __var="$1" __msg="$2" __def="${3:-y}" __ans=""
-  read -r -p "$__msg [y/N] (默认: ${__def^^}): " __ans || true
-  __ans="${__ans:-$__def}"
-  __ans="$(echo "$__ans" | tr '[:upper:]' '[:lower:]')"
-  [[ "$__ans" == "y" || "$__ans" == "yes" ]] && printf -v "$__var" "y" || printf -v "$__var" "n"
-}
-
-os_detect(){
-  source /etc/os-release
-  OS_ID="${ID:-unknown}"
-  OS_CODENAME="${VERSION_CODENAME:-}"
-  log "系统: ${PRETTY_NAME:-$OS_ID}"
-}
-
-apt_install(){
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y "$@"
-}
-
-install_docker(){
-  if has docker; then ok "Docker 已安装"; return; fi
-  log "安装 Docker（按系统自动选官方仓库，避免 Debian 用 Ubuntu 源 404）..."
-  apt_install ca-certificates curl gnupg lsb-release
-  install -m 0755 -d /etc/apt/keyrings
-  if [[ "$OS_ID" == "debian" ]]; then
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $OS_CODENAME stable" > /etc/apt/sources.list.d/docker.list
-  elif [[ "$OS_ID" == "ubuntu" ]]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $OS_CODENAME stable" > /etc/apt/sources.list.d/docker.list
-  else
-    warn "未知发行版：尝试安装 docker.io"
-    apt_install docker.io docker-compose-plugin
-    systemctl enable --now docker
-    return
-  fi
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
-  ok "Docker 安装完成"
-}
-
-install_nginx(){
-  if has nginx; then ok "Nginx 已安装"; return; fi
-  log "安装 Nginx..."
-  apt_install nginx
-  systemctl enable --now nginx
-  ok "Nginx 安装完成"
-}
-
-docker_rm_if_exists(){
-  local name="$1"
-  if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
-    log "删除旧容器: $name"
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    die "未检测到 docker compose"
   fi
 }
 
-# 禁用 sites-enabled 中与该域名 server_name 冲突的文件（改名为 .bak 时间戳）
-nginx_disable_domain_conflicts(){
-  local domain="$1" our="danmu_${domain}.conf" changed="n"
-  [[ -d /etc/nginx/sites-enabled ]] || return 0
-  while IFS= read -r -d '' f; do
-    [[ "$(basename "$f")" == "$our" ]] && continue
-    if grep -Eq "server_name\s+${domain//./\\.}(\s|;)" "$f"; then
-      warn "禁用冲突站点: $f"
-      mv -f "$f" "${f}.bak.$(date +%F_%H%M%S)"
-      changed="y"
-    fi
-  done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type f -print0 2>/dev/null || true)
-  if [[ "$changed" == "y" ]]; then
-    nginx -t && systemctl reload nginx || systemctl restart nginx
+yn(){
+  local p="$1" d="${2:-Y}" a
+  while true; do
+    read -rp "$p [${d/Y/Y\/n}${d/N/y\/N}]: " a || true
+    a="${a:-$d}"
+    case "${a,,}" in y|yes) return 0;; n|no) return 1;; esac
+  done
+}
+
+ask(){
+  local p="$1" d="${2:-}" a
+  read -rp "$p [默认 $d]: " a || true
+  echo "${a:-$d}"
+}
+
+gen_token(){
+  openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-' | cut -c1-22
+}
+
+container_exists(){
+  docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"
+}
+
+port_in_use(){
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$1$"
+}
+
+get_ip(){
+  ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}'
+}
+
+need docker
+COMPOSE="$(compose_cmd)"
+
+echo "=== LogVar 弹幕 一键安装 ==="
+
+if container_exists || [ -d "${APP_DIR}" ]; then
+  echo "检测到旧安装"
+  if yn "是否彻底删除旧安装？" Y; then
+    container_exists && docker rm -f "${CONTAINER_NAME}" || true
+    yn "是否删除镜像？" N && docker rmi -f "${IMAGE}" || true
+    yn "是否删除安装目录 ${APP_DIR}？" N && rm -rf "${APP_DIR}" || true
   fi
-}
+fi
 
-write_nginx_site(){
-  local domain="$1" upstream_host="$2" upstream_port="$3"
-  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-  local av="/etc/nginx/sites-available/danmu_${domain}.conf"
-  local en="/etc/nginx/sites-enabled/danmu_${domain}.conf"
+PORT="$(ask '请输入端口' "${DEFAULT_PORT}")"
+port_in_use "${PORT}" && yn "端口被占用，继续？" N || true
 
-  cat >"$av" <<EOF
-# Generated by danmu install.sh
-server {
-  listen 80;
-  listen [::]:80;
-  server_name ${domain};
+TOKEN="$(ask '普通 TOKEN' "${DEFAULT_TOKEN}")"
+ADMIN_TOKEN="$(ask '管理员 ADMIN_TOKEN' "$(gen_token)")"
 
-  location ^~ /.well-known/acme-challenge/ {
-    root /var/www/html;
-    allow all;
-  }
+SOURCE_ORDER="$(ask 'SOURCE_ORDER' "${DEFAULT_SOURCE_ORDER}")"
+OTHER_SERVER="$(ask 'OTHER_SERVER' "${DEFAULT_OTHER_SERVER}")"
+VOD_SERVERS="$(ask 'VOD_SERVERS' "${DEFAULT_VOD_SERVERS}")"
+VOD_RETURN_MODE="$(ask 'VOD_RETURN_MODE' "${DEFAULT_VOD_RETURN_MODE}")"
+VOD_REQUEST_TIMEOUT="$(ask 'VOD_REQUEST_TIMEOUT' "${DEFAULT_VOD_REQUEST_TIMEOUT}")"
+YOUKU_CONCURRENCY="$(ask 'YOUKU_CONCURRENCY' "${DEFAULT_YOUKU_CONCURRENCY}")"
 
-  location / {
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_pass http://${upstream_host}:${upstream_port};
-  }
-}
+echo ""
+echo "弹幕颜色模式（单选）："
+echo "  1) default"
+echo "  2) white   （默认）"
+echo "  3) color"
+read -rp "请选择 [1-3]: " COLOR_CHOICE
+case "${COLOR_CHOICE:-2}" in
+  1) CONVERT_COLOR="default" ;;
+  3) CONVERT_COLOR="color" ;;
+  *) CONVERT_COLOR="white" ;;
+esac
+
+CONVERT_TOP_BOTTOM_TO_SCROLL="true"
+
+BILI_COOKIE=""
+if yn "是否填写 B 站 Cookie？" N; then
+  read -rp "请输入 BILIBILI_COOKIE: " BILI_COOKIE
+fi
+
+AUTO_UPDATE=false
+yn "是否启用每天凌晨自动更新？" N && AUTO_UPDATE=true
+
+mkdir -p "${CONFIG_DIR}" "${CACHE_DIR}"
+
+cat > "${ENV_FILE}" <<EOF
+TOKEN=${TOKEN}
+ADMIN_TOKEN=${ADMIN_TOKEN}
+
+SOURCE_ORDER=${SOURCE_ORDER}
+OTHER_SERVER=${OTHER_SERVER}
+VOD_SERVERS=${VOD_SERVERS}
+VOD_RETURN_MODE=${VOD_RETURN_MODE}
+VOD_REQUEST_TIMEOUT=${VOD_REQUEST_TIMEOUT}
+YOUKU_CONCURRENCY=${YOUKU_CONCURRENCY}
+
+CONVERT_TOP_BOTTOM_TO_SCROLL=${CONVERT_TOP_BOTTOM_TO_SCROLL}
+CONVERT_COLOR=${CONVERT_COLOR}
 EOF
 
-  ln -sf "$av" "$en"
-  nginx -t
-  systemctl reload nginx
-  ok "Nginx 站点已启用: $en"
-}
+[ -n "${BILI_COOKIE}" ] && echo "BILIBILI_COOKIE=${BILI_COOKIE}" >> "${ENV_FILE}"
 
-enable_https_http01(){
-  local domain="$1" email="$2"
-  apt_install certbot python3-certbot-nginx
-  warn "HTTP-01 模式：如果 Cloudflare 橙云开启，可能失败。建议申请期间灰云（DNS only）。"
-  certbot --nginx -d "$domain" -m "$email" --agree-tos --no-eff-email --redirect
-  ok "HTTPS 已启用（HTTP-01）"
-}
-
-enable_https_dns01_cf(){
-  local domain="$1" email="$2" cf_token="$3"
-  apt_install certbot python3-certbot-dns-cloudflare
-  local cred_dir="/root/.secrets/certbot"; local cred_file="${cred_dir}/cloudflare.ini"
-  mkdir -p "$cred_dir"; chmod 700 "$cred_dir"
-  printf "dns_cloudflare_api_token = %s\n" "$cf_token" > "$cred_file"
-  chmod 600 "$cred_file"
-
-  certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$cred_file"     -d "$domain" -m "$email" --agree-tos --no-eff-email --non-interactive
-
-  # 追加 443 server（避免 certbot 自动改坏已有配置）
-  local av="/etc/nginx/sites-available/danmu_${domain}.conf"
-  if ! grep -q "listen 443" "$av"; then
-    cat >>"$av" <<EOF
-
-server {
-  listen 443 ssl http2;
-  listen [::]:443 ssl http2;
-  server_name ${domain};
-
-  ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-
-  ssl_protocols TLSv1.2 TLSv1.3;
-  ssl_prefer_server_ciphers off;
-
-  location / {
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto https;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_pass http://${NGINX_UPSTREAM_HOST}:${NGINX_UPSTREAM_PORT};
-  }
-}
+cat > "${COMPOSE_FILE}" <<EOF
+services:
+  danmu-api:
+    image: ${IMAGE}
+    container_name: ${CONTAINER_NAME}
+    ports:
+      - "${PORT}:9321"
+    volumes:
+      - ./config:/app/config
+      - ./.cache:/app/.cache
+    restart: unless-stopped
 EOF
-  fi
-  nginx -t
-  systemctl reload nginx
-  ok "HTTPS 已启用（DNS-01/Cloudflare）"
-}
 
-cf_api(){
-  local method="$1" url="$2" token="$3" data="${4:-}"
-  if [[ -n "$data" ]]; then
-    curl -sS -X "$method" "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data "$data"
-  else
-    curl -sS -X "$method" "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json"
-  fi
-}
+${COMPOSE} -f "${COMPOSE_FILE}" pull
+${COMPOSE} -f "${COMPOSE_FILE}" up -d
 
-cf_verify_token(){
-  local token="$1"
-  local r; r="$(cf_api GET "https://api.cloudflare.com/client/v4/user/tokens/verify" "$token")"
-  echo "$r" | grep -q '"success":true'
-}
+if ${AUTO_UPDATE} && [ "$(id -u)" = "0" ]; then
+  cat > "${CRON_FILE}" <<EOF
+5 3 * * * root cd ${APP_DIR} && ${COMPOSE} pull && ${COMPOSE} up -d > /var/log/danmu-api-autoupdate.log 2>&1
+EOF
+fi
 
-cf_find_zone_id(){
-  local token="$1" zone_name="$2"
-  local r; r="$(cf_api GET "https://api.cloudflare.com/client/v4/zones?name=${zone_name}" "$token")"
-  echo "$r" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n 1
-}
+IP="$(get_ip)"
 
-cf_upsert_a(){
-  local token="$1" zone_id="$2" fqdn="$3" ip="$4" proxied="$5"
-  local list rec_id payload
-  list="$(cf_api GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${fqdn}" "$token")"
-  rec_id="$(echo "$list" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n 1)"
-  payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$fqdn" "$ip" "$proxied")"
-  if [[ -n "$rec_id" ]]; then
-    cf_api PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${rec_id}" "$token" "$payload" >/dev/null
-  else
-    cf_api POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" "$token" "$payload" >/dev/null
-  fi
-  ok "Cloudflare A 记录已写入/更新：$fqdn -> $ip (proxied=$proxied)"
-}
-
-write_info(){
-  local f="/root/danmu-info.txt"
-  {
-    echo "=============================="
-    echo "Danmu 安装信息"
-    echo "时间: $(date -Is)"
-    echo
-    echo "容器: $DANMU_CONTAINER"
-    echo "镜像: $DANMU_IMAGE"
-    echo "宿主机端口: $DANMU_HOST_PORT (=> 容器端口 $DANMU_CONTAINER_PORT)"
-    echo
-    echo "访问:"
-    if [[ -n "$DOMAIN" ]]; then
-      if [[ "$HTTPS_ENABLED" == "y" ]]; then
-        echo "  普通: https://$DOMAIN/$PUBLIC_TOKEN"
-        echo "  管理: https://$DOMAIN/$ADMIN_PATH"
-      else
-        echo "  普通: http://$DOMAIN/$PUBLIC_TOKEN"
-        echo "  管理: http://$DOMAIN/$ADMIN_PATH"
-      fi
-    else
-      echo "  普通: http://$PUBLIC_IP:$DANMU_HOST_PORT/$PUBLIC_TOKEN"
-      echo "  管理: http://$PUBLIC_IP:$DANMU_HOST_PORT/$ADMIN_PATH"
-    fi
-    echo
-    echo "关键参数:"
-    echo "  普通 Token: $PUBLIC_TOKEN"
-    echo "  管理入口: $ADMIN_PATH"
-    echo "  ADMIN_TOKEN: $ADMIN_TOKEN"
-    echo "=============================="
-  } > "$f"
-  ok "安装完成。输出文件：$f"
-  echo
-  if [[ -n "$DOMAIN" ]]; then
-    [[ "$HTTPS_ENABLED" == "y" ]] && proto="https" || proto="http"
-    echo "普通: ${proto}://${DOMAIN}/${PUBLIC_TOKEN}"
-    echo "管理: ${proto}://${DOMAIN}/${ADMIN_PATH}"
-  else
-    echo "普通: http://${PUBLIC_IP}:${DANMU_HOST_PORT}/${PUBLIC_TOKEN}"
-    echo "管理: http://${PUBLIC_IP}:${DANMU_HOST_PORT}/${ADMIN_PATH}"
-  fi
-}
-
-main(){
-  need_root
-  os_detect
-  apt_install curl jq
-
-  echo "Danmu 一键安装（反代默认开启/可选CF/可选HTTPS）"
-  prompt DOMAIN "域名（没有就回车；不做HTTPS，直接IP访问）" ""
-  prompt DANMU_HOST_PORT "宿主机端口（Nginx 反代到它）" "8080"
-  prompt DANMU_IMAGE "Docker 镜像" "logvar/danmu-api:latest"
-  prompt DANMU_CONTAINER "容器名" "danmu-api"
-  prompt DANMU_CONTAINER_PORT "容器内部端口" "9321"
-  prompt PUBLIC_TOKEN "普通 Token（/数字 的数字部分）" "123987455"
-  prompt ADMIN_PATH "管理员路径（如 admin_888999，不要带/）" "admin_888999"
-  prompt ADMIN_TOKEN "ADMIN_TOKEN（系统管理令牌）" "CHANGE_ME_PLEASE"
-  prompt PUBLIC_IP "公网 IP（无域名访问/写CF A记录用；默认空，避免泄露）" ""
-
-  prompt_yn DO_PURGE "是否自动删除旧容器/旧站点后重装？" "y"
-
-  # Nginx upstream
-  NGINX_UPSTREAM_HOST="127.0.0.1"
-  NGINX_UPSTREAM_PORT="$DANMU_HOST_PORT"
-
-  # Cloudflare DNS
-  CF_AUTO="n"; CF_TOKEN=""; CF_ZONE_NAME=""; CF_ZONE_ID=""; CF_FQDN=""; CF_PROXIED="true"
-  prompt_yn CF_AUTO "是否用 Cloudflare API 自动写/更新 A 记录？" "n"
-  if [[ "$CF_AUTO" == "y" ]]; then
-    prompt CF_TOKEN "Cloudflare API Token（Zone:Read + DNS:Edit）" ""
-    cf_verify_token "$CF_TOKEN" || { err "Cloudflare Token 无法验证（Unable to authenticate request）"; exit 1; }
-    prompt CF_ZONE_NAME "Zone 名（主域名，如 dukiii1928.xyz）" ""
-    prompt CF_ZONE_ID "Zone ID（回车自动查；也可手动粘贴）" ""
-    [[ -z "$CF_ZONE_ID" ]] && CF_ZONE_ID="$(cf_find_zone_id "$CF_TOKEN" "$CF_ZONE_NAME")"
-    [[ -n "$CF_ZONE_ID" ]] || { err "获取 Zone ID 失败"; exit 1; }
-    CF_FQDN="${DOMAIN:-}"
-    [[ -z "$CF_FQDN" ]] && prompt CF_FQDN "要创建的记录 FQDN（如 dm.dukiii1928.xyz）" ""
-    prompt_yn CF_PXY "A记录是否开橙云(Proxied)？" "y"
-    [[ "$CF_PXY" == "y" ]] && CF_PROXIED="true" || CF_PROXIED="false"
-    [[ -n "$PUBLIC_IP" ]] || { err "选择了写 A 记录但没填公网 IP"; exit 1; }
-  fi
-
-  # HTTPS（仅域名）
-  HTTPS_ENABLED="n"; HTTPS_MODE="none"; LE_EMAIL=""
-  if [[ -n "$DOMAIN" ]]; then
-    prompt_yn HTTPS_ENABLED "是否启用 HTTPS(LE)？" "y"
-    if [[ "$HTTPS_ENABLED" == "y" ]]; then
-      prompt LE_EMAIL "证书邮箱（建议写你的邮箱，用于到期通知）" ""
-      prompt_yn USE_DNS01 "是否使用 DNS-01(Cloudflare) 验证？(推荐，橙云不用关)" "y"
-      if [[ "$USE_DNS01" == "y" ]]; then
-        HTTPS_MODE="dns01"
-        [[ -n "$CF_TOKEN" ]] || prompt CF_TOKEN "Cloudflare Token（DNS-01 用，需 DNS:Edit）" ""
-        cf_verify_token "$CF_TOKEN" || { err "Cloudflare Token 无法验证"; exit 1; }
-      else
-        HTTPS_MODE="http01"
-      fi
-    fi
-  fi
-
-  install_docker
-  install_nginx
-
-  if [[ "$DO_PURGE" == "y" ]]; then
-    docker_rm_if_exists "$DANMU_CONTAINER"
-    if [[ -n "$DOMAIN" ]]; then
-      rm -f "/etc/nginx/sites-enabled/danmu_${DOMAIN}.conf" "/etc/nginx/sites-available/danmu_${DOMAIN}.conf" || true
-      nginx_disable_domain_conflicts "$DOMAIN"
-    fi
-  fi
-
-  log "启动容器..."
-  docker pull "$DANMU_IMAGE" >/dev/null
-  docker run -d --restart=always --name "$DANMU_CONTAINER"     -p "${DANMU_HOST_PORT}:${DANMU_CONTAINER_PORT}"     -e "TOKEN=${PUBLIC_TOKEN}"     -e "ADMIN_TOKEN=${ADMIN_TOKEN}"     -e "ADMIN_PATH=${ADMIN_PATH}"     "$DANMU_IMAGE" >/dev/null
-  ok "容器已启动：$DANMU_CONTAINER"
-
-  if [[ -n "$DOMAIN" ]]; then
-    nginx_disable_domain_conflicts "$DOMAIN"
-    write_nginx_site "$DOMAIN" "$NGINX_UPSTREAM_HOST" "$NGINX_UPSTREAM_PORT"
-  else
-    warn "未填写域名：跳过 Nginx 站点写入（仍可 IP:端口 访问）"
-    [[ -n "$PUBLIC_IP" ]] || warn "未填写公网 IP：无域名访问地址将无法自动打印（可后续自己填）"
-  fi
-
-  if [[ "$CF_AUTO" == "y" ]]; then
-    cf_upsert_a "$CF_TOKEN" "$CF_ZONE_ID" "$CF_FQDN" "$PUBLIC_IP" "$CF_PROXIED"
-  fi
-
-  if [[ -n "$DOMAIN" && "$HTTPS_ENABLED" == "y" ]]; then
-    if [[ "$HTTPS_MODE" == "dns01" ]]; then
-      enable_https_dns01_cf "$DOMAIN" "$LE_EMAIL" "$CF_TOKEN"
-    else
-      enable_https_http01 "$DOMAIN" "$LE_EMAIL"
-    fi
-  fi
-
-  write_info
-}
-
-main "$@"
+echo ""
+echo "=== 安装完成 ==="
+echo "普通访问:"
+echo "  http://${IP}:${PORT}/${TOKEN}"
+echo "管理员访问:"
+echo "  http://${IP}:${PORT}/${ADMIN_TOKEN}"
