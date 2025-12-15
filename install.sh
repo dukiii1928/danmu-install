@@ -347,22 +347,32 @@ main() {
 
   local use_cf="n"
   local cf_token="" cf_zone_id="" cf_proxied="true" server_ip=""
+  local hide_ip_output="y"
   if [ -n "$domain" ] && yesno "是否使用 Cloudflare API 自动创建/更新 DNS A 记录？（需要 Token）" "n"; then
     use_cf="y"
     echo "建议 Token 权限：Zone:Read + DNS:Edit（仅限该域）"
     cf_token="$(ask "输入 Cloudflare API Token" "")"
     cf_zone_id="$(ask "输入 Cloudflare Zone ID（概览里“区域ID/Zone ID”那串）" "")"
     if yesno "A 记录是否开启橙云代理（Proxied）？" "y"; then
+
+    local hide_ip_output="y"
+    if yesno "是否在脚本输出/总结里隐藏服务器真实IP？（推荐）" "y"; then
+      hide_ip_output="y"
+    else
+      hide_ip_output="n"
+    fi
       cf_proxied="true"
     else
       cf_proxied="false"
     fi
 
-    server_ip="$(detect_public_ip)"
+    server_ip="$(ask "Cloudflare DNS A 记录要指向的服务器公网 IP（建议填你的服务器IP；留空则自动探测，但不会回显）" "")"
+    if [ -z "$server_ip" ]; then
+      server_ip="$(detect_public_ip)"
+    fi
     if [ -z "$server_ip" ]; then
       server_ip="$(ask "自动探测公网 IP 失败，请手动输入服务器公网 IP" "")"
-    else
-      server_ip="$(ask "探测到服务器公网 IP：${server_ip}，如需修改请输入新 IP" "${server_ip}")"
+    fi
     fi
   fi
 
@@ -392,7 +402,11 @@ main() {
   echo "普通 Token：/${public_token}"
   echo "管理员 Token：/admin_${admin_token}"
   if [ "$use_cf" = "y" ]; then
-    echo "Cloudflare：自动DNS=是，ZoneID=${cf_zone_id}，proxied=${cf_proxied}，IP=${server_ip}"
+    if [ "${hide_ip_output:-y}" = "y" ]; then
+      echo "Cloudflare：自动DNS=是，ZoneID=${cf_zone_id}，proxied=${cf_proxied}，IP=<hidden>"
+    else
+      echo "Cloudflare：自动DNS=是，ZoneID=${cf_zone_id}，proxied=${cf_proxied}，IP=${server_ip}"
+    fi
   else
     echo "Cloudflare：自动DNS=否"
   fi
@@ -439,7 +453,11 @@ main() {
     echo
     echo "基础参数："
     echo "  系统：$(. /etc/os-release && echo "$PRETTY_NAME")"
-    echo "  公网IP：${ip}"
+    if [ "${hide_ip_output:-y}" = "y" ]; then
+      echo "  公网IP：<hidden>"
+    else
+      echo "  公网IP：${ip}"
+    fi
     echo "  域名：${domain:-<无>}"
     echo "  Nginx：启用（对外端口 80/443）"
     echo "  Upstream：${upstream}"
@@ -462,7 +480,11 @@ main() {
       echo "Cloudflare："
       echo "  Zone ID：${cf_zone_id}"
       echo "  Proxied：${cf_proxied}"
-      echo "  A 记录：${domain} -> ${server_ip}"
+      if [ "${hide_ip_output:-y}" = "y" ]; then
+        echo "  A 记录：${domain} -> <hidden>"
+      else
+        echo "  A 记录：${domain} -> ${server_ip}"
+      fi
     fi
     if [ "$enable_https" = "y" ]; then
       echo "HTTPS："
