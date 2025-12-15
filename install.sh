@@ -1,216 +1,135 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# =========================================================
+# Danmu / LogVar 弹幕 API 一键安装（最终稳定版）
+# 适用：Debian 11/12/13、Ubuntu 20.04/22.04/24.04
+# 架构：Docker + 系统 Nginx + 可选 HTTPS + 可选 Cloudflare DNS
+#
+# 设计目标：
+# - 不依赖 1Panel / OpenResty
+# - 不引入 Docker 官方 apt 仓库（避免 Debian 上误加 Ubuntu 源导致 404）
+# - 只管理“本脚本创建”的站点与容器；可选“接管 Nginx”清空现有站点
+# =========================================================
 
-# Danmu 一键安装（Docker + Nginx 反代 + 可选 Cloudflare DNS + 可选 HTTPS/自动续期）
-# 适配：Debian/Ubuntu（优先 Debian Bookworm；Ubuntu 也可用）
-# 输出：/root/danmu_info.txt
+set -Eeuo pipefail
 
-# -----------------------------
-# 工具函数
-# -----------------------------
-c_red(){ printf "\033[31m%s\033[0m\n" "$*"; }
-c_grn(){ printf "\033[32m%s\033[0m\n" "$*"; }
-c_yel(){ printf "\033[33m%s\033[0m\n" "$*"; }
-c_cyn(){ printf "\033[36m%s\033[0m\n" "$*"; }
+APP_NAME="danmu-api"
+DOCKER_IMAGE_DEFAULT="logvar/danmu-api:latest"
+CONTAINER_PORT="9321"
+INFO_FILE="/root/danmu-info.txt"
 
-die(){ c_red "[ERROR] $*"; exit 1; }
+# ---------- 输出/日志 ----------
+c_reset="\033[0m"; c_red="\033[31m"; c_green="\033[32m"; c_yellow="\033[33m"; c_blue="\033[34m"; c_cyan="\033[36m"
+log()  { echo -e "${c_cyan}[INFO]${c_reset} $*"; }
+ok()   { echo -e "${c_green}[OK]${c_reset} $*"; }
+warn() { echo -e "${c_yellow}[WARN]${c_reset} $*"; }
+err()  { echo -e "${c_red}[ERR]${c_reset} $*"; }
 
-need_root(){
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "请用 root 运行：sudo -i 之后再执行。"
-  fi
+die() { err "$*"; exit 1; }
+
+on_error() {
+  local exit_code=$?
+  err "脚本执行失败（exit=$exit_code）。请把屏幕最后 30 行发我排查。"
+  exit $exit_code
+}
+trap on_error ERR
+
+need_root() {
+  [[ "${EUID}" -eq 0 ]] || die "请用 root 运行：sudo -i 后再执行脚本"
 }
 
-have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+# ---------- 工具 ----------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-read_default(){
-  # $1 prompt, $2 default
-  local prompt="$1" def="$2" v
-  read -r -p "$prompt (默认: $def): " v || true
-  if [[ -z "${v// }" ]]; then echo "$def"; else echo "$v"; fi
+read_yn() {
+  local prompt="$1" default="${2:-N}" ans
+  while true; do
+    read -r -p "$prompt [y/N] (默认:$default): " ans || true
+    ans="${ans:-$default}"
+    case "${ans,,}" in
+      y|yes) echo "y"; return;;
+      n|no)  echo "n"; return;;
+      *) echo "请输入 y 或 n";;
+    esac
+  done
 }
 
-read_yesno(){
-  # $1 prompt, $2 default(y/n)
-  local prompt="$1" def="${2,,}" v
-  local showdef
-  if [[ "$def" == "y" ]]; then showdef="Y/n"; else showdef="y/N"; fi
-  read -r -p "$prompt [$showdef]: " v || true
-  v="${v,,}"
-  if [[ -z "${v// }" ]]; then v="$def"; fi
-  [[ "$v" == "y" || "$v" == "yes" ]]
+read_text() {
+  local prompt="$1" default="${2:-}" var
+  read -r -p "$prompt${default:+ (默认: $default)}: " var || true
+  echo "${var:-$default}"
 }
 
-os_detect(){
-  . /etc/os-release 2>/dev/null || true
-  echo "${ID:-unknown}:${VERSION_CODENAME:-}:${VERSION_ID:-}"
+is_debian_like() {
+  [[ -f /etc/os-release ]] || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *"debian"* || "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *"ubuntu"* ]]
 }
 
-public_ip_guess(){
-  # 不主动暴露真实 IP（用户要求默认随便写一个）
-  # 这里默认值给 1.1.1.1；用户可手动填写真实 IP
-  echo "1.1.1.1"
-}
-
-random_token(){
-  tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 10
-}
-
-# -----------------------------
-# Cloudflare API（DNS upsert）
-# -----------------------------
-cf_api(){
-  # $1 method $2 url $3 json(optional)
-  local method="$1" url="$2" data="${3:-}"
-  if [[ -n "$data" ]]; then
-    curl -fsS -X "$method" "$url" \
-      -H "Authorization: Bearer ${CF_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --data "$data"
-  else
-    curl -fsS -X "$method" "$url" \
-      -H "Authorization: Bearer ${CF_TOKEN}" \
-      -H "Content-Type: application/json"
-  fi
-}
-
-cf_zone_check(){
-  local z
-  z="$(cf_api GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")" || return 1
-  echo "$z" | grep -q '"success":true'
-}
-
-cf_dns_get_a(){
-  # $1 fqdn
-  local name="$1"
-  cf_api GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=A&name=${name}"
-}
-
-cf_dns_upsert_a(){
-  # $1 fqdn $2 ip $3 proxied(true/false)
-  local name="$1" ip="$2" proxied="$3"
-  local resp rid
-  resp="$(cf_dns_get_a "$name")" || die "Cloudflare 查询 DNS 失败。"
-  rid="$(echo "$resp" | sed -n 's/.*"id":"\([^"]\+\)".*/\1/p' | head -n1 || true)"
-
-  local payload
-  payload="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":%s}' "$name" "$ip" "$proxied")"
-
-  if [[ -n "$rid" ]]; then
-    cf_api PATCH "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${rid}" "$payload" \
-      || die "Cloudflare 更新 A 记录失败（PATCH）。"
-    echo "$rid"
-  else
-    cf_api POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" "$payload" \
-      || die "Cloudflare 创建 A 记录失败（POST）。"
-    # 再查一次拿 id
-    resp="$(cf_dns_get_a "$name")" || true
-    rid="$(echo "$resp" | sed -n 's/.*"id":"\([^"]\+\)".*/\1/p' | head -n1 || true)"
-    echo "${rid:-created}"
-  fi
-}
-
-# -----------------------------
-# Docker 安装（Debian/Ubuntu）
-# -----------------------------
-install_docker(){
-  if have_cmd docker; then
-    c_grn "[OK] 检测到 Docker 已安装：$(docker --version 2>/dev/null || true)"
-    return 0
-  fi
-
-  c_yel "[INFO] 安装 Docker..."
+apt_install_base() {
+  export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg lsb-release
+  apt-get install -y ca-certificates curl jq nginx certbot python3-certbot-nginx docker.io
+  systemctl enable --now nginx docker
+}
 
-  local os id codename
-  id="$(. /etc/os-release; echo "${ID}")"
-  codename="$(. /etc/os-release; echo "${VERSION_CODENAME:-}")"
-
-  install -m 0755 -d /etc/apt/keyrings
-
-  if [[ "$id" == "debian" ]]; then
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo \
-"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${codename:-bookworm} stable" \
-      > /etc/apt/sources.list.d/docker.list
-  elif [[ "$id" == "ubuntu" ]]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo \
-"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename:-jammy} stable" \
-      > /etc/apt/sources.list.d/docker.list
-  else
-    die "不支持的系统：$id。"
+docker_clean_previous() {
+  if has_cmd docker; then
+    if docker ps -a --format '{{.Names}}' | grep -qx "$APP_NAME"; then
+      log "删除旧容器：$APP_NAME"
+      docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
+      ok "旧容器已删除"
+    fi
   fi
-
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
-  c_grn "[OK] Docker 安装完成：$(docker --version)"
 }
 
-# -----------------------------
-# Nginx / Certbot
-# -----------------------------
-install_nginx_certbot(){
-  c_yel "[INFO] 安装 Nginx（以及可选 certbot）..."
-  apt-get update -y
-  apt-get install -y nginx
-  systemctl enable --now nginx
-
-  # certbot 是可选；仅当用户启用 HTTPS 才会装
+nginx_takeover_cleanup() {
+  local takeover="$1"
+  if [[ "$takeover" == "y" ]]; then
+    warn "你选择了“接管 Nginx”：将清空 /etc/nginx/sites-enabled 和 sites-available 下的所有站点文件。"
+    rm -f /etc/nginx/sites-enabled/* || true
+    rm -f /etc/nginx/sites-available/* || true
+    ok "Nginx 站点目录已清空"
+  fi
 }
 
-write_nginx_site(){
-  # 生成站点配置：/etc/nginx/sites-available/<domain>.conf
-  # 注意：脚本启用了 set -u（引用未定义变量会直接退出）。这里给上游端口一个安全默认值。
-  local upstream_port="${NGINX_UPSTREAM_PORT:-8080}"
-  local domain="$1" upstream="127.0.0.1:${upstream_port}" enable_https="$2"
-  local conf="/etc/nginx/sites-available/${domain}.conf"
-  local link="/etc/nginx/sites-enabled/${domain}.conf"
-
-  mkdir -p /var/www/_acme_challenge
-
-  cat >"$conf" <<EOF
-# Auto-generated by danmu installer
-# Domain: ${domain}
-# Upstream: ${upstream}
-
-map \$http_upgrade \$connection_upgrade {
-  default upgrade;
-  ''      close;
-}
-
+write_nginx_http_only_conf() {
+  local domain="$1" webroot="$2" conf="/etc/nginx/sites-available/${domain}.conf"
+  cat > "$conf" <<EOF
 server {
   listen 80;
   server_name ${domain};
 
-  # Let's Encrypt HTTP-01 challenge
-  location ^~ /.well-known/acme-challenge/ {
-    root /var/www/_acme_challenge;
-    default_type "text/plain";
-    allow all;
+  location /.well-known/acme-challenge/ {
+    root ${webroot};
   }
 
   location / {
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection \$connection_upgrade;
-
-    proxy_pass http://${upstream};
+    return 200 "ACME OK\n";
+    add_header Content-Type text/plain;
   }
 }
 EOF
+  ln -sf "$conf" "/etc/nginx/sites-enabled/${domain}.conf"
+}
 
-  if [[ "$enable_https" == "true" ]]; then
-    cat >>"$conf" <<EOF
+write_nginx_https_conf() {
+  local domain="$1" webroot="$2" upstream_port="$3"
+  local conf="/etc/nginx/sites-available/${domain}.conf"
+  cat > "$conf" <<EOF
+# ${domain} - managed by danmu install script
+server {
+  listen 80;
+  server_name ${domain};
+
+  location /.well-known/acme-challenge/ {
+    root ${webroot};
+  }
+
+  location / {
+    return 301 https://\$host\$request_uri;
+  }
+}
 
 server {
   listen 443 ssl http2;
@@ -219,283 +138,314 @@ server {
   ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
   ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
-  # 基本安全参数（兼容性优先）
   ssl_protocols TLSv1.2 TLSv1.3;
-  ssl_prefer_server_ciphers off;
 
   location / {
+    proxy_pass http://127.0.0.1:${upstream_port};
     proxy_http_version 1.1;
+
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Proto \$scheme;
 
     proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection \$connection_upgrade;
-
-    proxy_pass http://${upstream};
+    proxy_set_header Connection "upgrade";
   }
 }
 EOF
-  fi
+  ln -sf "$conf" "/etc/nginx/sites-enabled/${domain}.conf"
+}
 
-  rm -f "$link"
-  ln -s "$conf" "$link"
-
-  # 关闭默认站点，避免冲突
-  rm -f /etc/nginx/sites-enabled/default || true
-
+nginx_reload_strict() {
   nginx -t
   systemctl reload nginx
 }
 
-certbot_http01(){
-  local domain="$1" email="$2"
-  apt-get update -y
-  apt-get install -y certbot python3-certbot-nginx
-
-  # 依赖 http-01：要求 DNS 解析到本机，且 Cloudflare 建议临时灰云
-  certbot certonly --nginx -d "$domain" --agree-tos -m "$email" --non-interactive --redirect || \
-    certbot certonly --nginx -d "$domain" --agree-tos -m "$email" --non-interactive
-
-  systemctl enable --now certbot.timer || true
+certbot_issue_webroot() {
+  local domain="$1" email="$2" webroot="$3"
+  mkdir -p "$webroot/.well-known/acme-challenge"
+  certbot certonly --webroot -w "$webroot" -d "$domain" \
+    --agree-tos --email "$email" --non-interactive --keep-until-expiring
 }
 
-# DNS-01：用 Cloudflare Token 直接签发（无需灰云）
-certbot_dns01_cf(){
-  local domain="$1" email="$2"
-  apt-get update -y
-  apt-get install -y certbot python3-certbot-dns-cloudflare
-
-  local cred="/root/.secrets/cf.ini"
-  mkdir -p /root/.secrets
-  chmod 700 /root/.secrets
-  cat >"$cred" <<EOF
-dns_cloudflare_api_token = ${CF_TOKEN}
-EOF
-  chmod 600 "$cred"
-
-  certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$cred" \
-    -d "$domain" --agree-tos -m "$email" --non-interactive
-
-  systemctl enable --now certbot.timer || true
-}
-
-# -----------------------------
-# 清理旧环境（可重复安装）
-# -----------------------------
-cleanup_old(){
-  c_yel "[INFO] 清理旧环境（如存在）..."
-
-  # 停止并删除旧容器（按名称）
-  if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-    c_grn "[OK] 已删除旧容器：${CONTAINER_NAME}"
-  fi
-
-  # 清理旧 nginx 站点
-  if [[ -n "${DOMAIN:-}" ]]; then
-    rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf" "/etc/nginx/sites-available/${DOMAIN}.conf" || true
-    # 不主动删除证书（避免误删），如需全删可手动 certbot delete
+# ---------- Cloudflare DNS（可选） ----------
+cf_api() {
+  local method="$1" url="$2" token="$3" data="${4:-}"
+  if [[ -n "$data" ]]; then
+    curl -fsS -X "$method" "https://api.cloudflare.com/client/v4${url}" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      --data "$data"
+  else
+    curl -fsS -X "$method" "https://api.cloudflare.com/client/v4${url}" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json"
   fi
 }
 
-# -----------------------------
-# 主流程
-# -----------------------------
-need_root
+cf_upsert_A_record() {
+  local zone_id="$1" token="$2" name="$3" content_ip="$4" proxied="$5"
 
-c_cyn "Danmu 一键安装（反代默认开启 / 可选 Cloudflare / 可选 HTTPS）"
-echo
+  # 查询现有记录
+  local q
+  q="$(cf_api GET "/zones/${zone_id}/dns_records?type=A&name=${name}" "$token")" || die "Cloudflare API 请求失败（查询 DNS 记录）。"
+  local success
+  success="$(echo "$q" | jq -r '.success')" || true
+  [[ "$success" == "true" ]] || die "Cloudflare 返回失败：$(echo "$q" | jq -c '.errors')"
 
-# 1) 基本参数
-DOMAIN="$(read_default "请输入域名（没有就直接回车；无域名则仅 IP:端口 访问）" "")"
-NGINX_ENABLE=true
-if [[ -z "${DOMAIN}" ]]; then
-  c_yel "[INFO] 未填写域名：将使用 IP:端口 访问。Nginx 仍可用，但不配置 HTTPS。"
-fi
+  local rec_id
+  rec_id="$(echo "$q" | jq -r '.result[0].id // empty')"
 
-HOST_PORT="$(read_default "弹幕服务宿主机端口（外部访问端口）" "8080")"
-IMAGE="$(read_default "弹幕 Docker 镜像" "logvar/danmu-api:latest")"
-CONTAINER_NAME="$(read_default "弹幕容器名称" "danmu-api")"
-CONTAINER_PORT="$(read_default "弹幕容器内部端口（镜像暴露端口）" "9321")"
+  local payload
+  payload="$(jq -nc --arg type "A" --arg name "$name" --arg content "$content_ip" --argjson proxied "$proxied" \
+              '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')" || true
 
-PUBLIC_TOKEN="$(read_default "普通用户 Token（路径用 /<token>）" "123987455")"
-ADMIN_SUFFIX="$(read_default "管理员 Token（路径用 /admin_<token>；无需输入 admin_）" "888999")"
-ADMIN_TOKEN="admin_${ADMIN_SUFFIX}"
-
-# 2) Cloudflare DNS（可选）
-CF_ENABLE=false
-CF_PROXIED=false
-if [[ -n "${DOMAIN}" ]]; then
-  if read_yesno "是否使用 Cloudflare API 自动创建/更新 DNS A 记录？（需要 Token）" "y"; then
-    CF_ENABLE=true
-    CF_TOKEN="$(read_default "输入 Cloudflare API Token（必须有 Zone:Read + DNS:Edit）" "")"
-    CF_ZONE_ID="$(read_default "输入 Cloudflare Zone ID（区域 ID，不是账户 ID）" "")"
-    if [[ -z "${CF_TOKEN}" || -z "${CF_ZONE_ID}" ]]; then
-      die "Cloudflare Token / Zone ID 不能为空。"
-    fi
-    if ! cf_zone_check >/dev/null 2>&1; then
-      die "Cloudflare Token/ZoneID 校验失败（无法访问 zone）。请检查 Token 权限/ZoneID。"
-    fi
-
-    if read_yesno "A 记录是否开启橙云代理（Proxied）？" "y"; then
-      CF_PROXIED=true
-    fi
+  if [[ -n "$rec_id" ]]; then
+    log "Cloudflare：更新 A 记录 $name -> $content_ip (proxied=$proxied)"
+    local r
+    r="$(cf_api PUT "/zones/${zone_id}/dns_records/${rec_id}" "$token" "$payload")" || die "Cloudflare API 请求失败（更新 DNS 记录）。"
+    [[ "$(echo "$r" | jq -r '.success')" == "true" ]] || die "更新失败：$(echo "$r" | jq -c '.errors')"
+    ok "DNS 记录已更新"
+  else
+    log "Cloudflare：创建 A 记录 $name -> $content_ip (proxied=$proxied)"
+    local r
+    r="$(cf_api POST "/zones/${zone_id}/dns_records" "$token" "$payload")" || die "Cloudflare API 请求失败（创建 DNS 记录）。"
+    [[ "$(echo "$r" | jq -r '.success')" == "true" ]] || die "创建失败：$(echo "$r" | jq -c '.errors')"
+    ok "DNS 记录已创建"
   fi
-else
-  c_yel "[INFO] 无域名：跳过 Cloudflare DNS。"
-fi
+}
 
-# 3) HTTPS（可选）
-HTTPS_ENABLE=false
-HTTPS_MODE="none"
-LE_EMAIL=""
-if [[ -n "${DOMAIN}" ]]; then
-  if read_yesno "是否启用 HTTPS（Let's Encrypt）？" "y"; then
-    HTTPS_ENABLE=true
-    LE_EMAIL="$(read_default "请输入证书邮箱（Let's Encrypt）" "admin@${DOMAIN}")"
+# ---------- 主流程 ----------
+main() {
+  need_root
+  is_debian_like || die "仅支持 Debian/Ubuntu 系。"
 
-    if $CF_ENABLE && read_yesno "是否使用 Cloudflare DNS-01（推荐：无需灰云）签发证书？" "y"; then
-      HTTPS_MODE="dns01_cf"
+  clear || true
+  echo -e "${c_blue}Danmu 一键安装（最终稳定版）${c_reset}"
+  echo "（Docker + Nginx + 可选 HTTPS + 可选 Cloudflare DNS）"
+  echo
+
+  # 选择是否接管 Nginx（清空现有站点）
+  local takeover
+  takeover="$(read_yn "是否“接管 Nginx”（清空 /etc/nginx/sites-available 和 sites-enabled 现有站点）？" "N")"
+
+  # 域名（可空）
+  local domain
+  domain="$(read_text "请输入域名（没有就直接回车，仅用 IP:端口 访问）" "")"
+  domain="${domain,,}"
+
+  # 端口与镜像
+  local upstream_port
+  upstream_port="$(read_text "弹幕服务宿主机端口（Nginx 反代/外部访问将到这个端口）" "8080")"
+  [[ "$upstream_port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
+
+  local docker_image
+  docker_image="$(read_text "弹幕 Docker 镜像" "$DOCKER_IMAGE_DEFAULT")"
+
+  # Token
+  local normal_token admin_token
+  normal_token="$(read_text "普通访问 Token（路径用，例如 /123987455）" "123987455")"
+  admin_token="$(read_text "管理员 Token（路径用，例如 /admin_888999；无需写 admin_ 前缀也可）" "888999")"
+  # 规范化 admin token
+  if [[ "$admin_token" != admin_* ]]; then
+    admin_token="admin_${admin_token}"
+  fi
+
+  # Cloudflare DNS（可选）
+  local use_cf cf_token zone_id cf_record_name proxied_flag
+  use_cf="$(read_yn "是否使用 Cloudflare API 自动创建/更新 DNS A 记录？（需要 Token+ZoneID）" "N")"
+  if [[ "$use_cf" == "y" ]]; then
+    cf_token="$(read_text "输入 Cloudflare API Token（需：Zone:Read + DNS:Edit）" "")"
+    zone_id="$(read_text "输入 Cloudflare Zone ID（区域 ID，不是账户 ID）" "")"
+    [[ -n "$cf_token" && -n "$zone_id" ]] || die "Cloudflare Token/ZoneID 不能为空"
+
+    # 记录名：如果有域名，默认用域名；否则让用户输入
+    if [[ -n "$domain" ]]; then
+      cf_record_name="$(read_text "DNS 记录全名（例如 dm.example.com）" "$domain")"
     else
-      HTTPS_MODE="http01"
-      c_yel "[提示] HTTP-01 方式：建议 Cloudflare 暂时灰云（DNS only），签发成功后再切回橙云。"
+      cf_record_name="$(read_text "DNS 记录全名（例如 dm.example.com）" "")"
+      [[ -n "$cf_record_name" ]] || die "未输入 DNS 记录名"
     fi
-  fi
-fi
 
-# 4) IP 提示（默认不暴露真实 IP）
-SERVER_IP_DEFAULT="$(public_ip_guess)"
-SERVER_IP="$(read_default "安装信息展示用 IP（不影响实际服务；可随便填，避免暴露）" "$SERVER_IP_DEFAULT")"
+    # content IP：不自动探测，避免暴露；必须用户输入
+    local content_ip
+    content_ip="$(read_text "请输入服务器公网 IP（用于 A 记录 content；不会自动检测）" "")"
+    [[ -n "$content_ip" ]] || die "未输入公网 IP"
 
-echo
-c_cyn "========== 配置预览 =========="
-echo "域名: ${DOMAIN:-<无>}"
-echo "Upstream: http://127.0.0.1:${HOST_PORT}"
-echo "Docker 镜像: ${IMAGE}"
-echo "容器名: ${CONTAINER_NAME}"
-echo "端口映射: ${HOST_PORT} -> ${CONTAINER_PORT}"
-echo "普通 Token: /${PUBLIC_TOKEN}"
-echo "管理员 Token: /${ADMIN_TOKEN}"
-if $CF_ENABLE; then
-  echo "Cloudflare: DNS 自动=是, ZoneID=${CF_ZONE_ID}, proxied=${CF_PROXIED}, 记录=${DOMAIN}"
-else
-  echo "Cloudflare: DNS 自动=否"
-fi
-if $HTTPS_ENABLE; then
-  echo "HTTPS: 是, 模式=${HTTPS_MODE}, 邮箱=${LE_EMAIL}"
-else
-  echo "HTTPS: 否"
-fi
-echo "展示用 IP: ${SERVER_IP}"
-c_cyn "=============================="
-echo
-
-if ! read_yesno "确认开始安装？" "y"; then
-  die "用户取消。"
-fi
-
-# 5) 安装依赖
-install_docker
-
-if $NGINX_ENABLE; then
-  install_nginx_certbot
-fi
-
-# 6) 清理旧环境
-cleanup_old
-
-# 7) 启动容器
-c_yel "[INFO] 拉取镜像并启动容器..."
-docker pull "${IMAGE}"
-docker run -d --name "${CONTAINER_NAME}" --restart unless-stopped \
-  -p "${HOST_PORT}:${CONTAINER_PORT}" \
-  "${IMAGE}"
-
-c_grn "[OK] 容器已启动：${CONTAINER_NAME}"
-sleep 1
-
-# 8) Nginx 反代（有域名则配置域名站点；无域名则仅提示 IP:端口）
-BASE_HTTP_URL=""
-BASE_HTTPS_URL=""
-
-if [[ -n "${DOMAIN}" ]]; then
-  # 8.1 Cloudflare DNS（可选）
-  if $CF_ENABLE; then
-    c_yel "[INFO] Cloudflare：写/更新 A 记录 ${DOMAIN} -> (你的服务器 IP)"
-    # DNS 内容必须是服务器真实公网 IP（这里不猜，要求用户输入）
-    REAL_IP="$(read_default "请输入服务器真实公网 IP（用于 DNS A 记录 content）" "")"
-    if [[ -z "$REAL_IP" ]]; then
-      die "真实公网 IP 不能为空（否则无法写 A 记录）。"
-    fi
-    rid="$(cf_dns_upsert_a "${DOMAIN}" "${REAL_IP}" "$( $CF_PROXIED && echo true || echo false )")"
-    c_grn "[OK] Cloudflare DNS 已写入/更新（record id: $rid）"
-  fi
-
-  # 8.2 先写 HTTP 站点（不带 443），必要时用于签发
-  write_nginx_site "${DOMAIN}" "false"
-  BASE_HTTP_URL="http://${DOMAIN}"
-
-  # 8.3 HTTPS
-  if $HTTPS_ENABLE; then
-    if [[ "$HTTPS_MODE" == "dns01_cf" ]]; then
-      certbot_dns01_cf "${DOMAIN}" "${LE_EMAIL}"
+    # 是否橙云
+    local proxied
+    proxied="$(read_yn "A 记录是否开启橙云代理（Proxied）？" "Y")"
+    if [[ "$proxied" == "y" ]]; then
+      proxied_flag="true"
     else
-      certbot_http01 "${DOMAIN}" "${LE_EMAIL}"
+      proxied_flag="false"
     fi
-    # 写入带 443 的完整站点
-    write_nginx_site "${DOMAIN}" "true"
-    BASE_HTTPS_URL="https://${DOMAIN}"
+
+    # 执行 upsert
+    cf_upsert_A_record "$zone_id" "$cf_token" "$cf_record_name" "$content_ip" "$proxied_flag"
   fi
-else
-  # 无域名：不写站点；用户直接 IP:端口访问
-  BASE_HTTP_URL="http://${SERVER_IP}:${HOST_PORT}"
-fi
 
-# 9) 输出信息
-INFO_FILE="/root/danmu_info.txt"
-cat >"$INFO_FILE" <<EOF
-Danmu 安装完成（$(date -Is))
+  # HTTPS（仅在有域名时）
+  local enable_https email
+  enable_https="n"
+  email=""
+  if [[ -n "$domain" ]]; then
+    enable_https="$(read_yn "是否启用 HTTPS（Let's Encrypt）？（要求：域名已解析到本机，且申请证书时建议灰云）" "Y")"
+    if [[ "$enable_https" == "y" ]]; then
+      email="$(read_text "请输入证书邮箱（Let's Encrypt 用于到期通知）" "admin@${domain}")"
+    fi
+  fi
 
-[访问地址]
-普通接口:
-  ${BASE_HTTPS_URL:-$BASE_HTTP_URL}/${PUBLIC_TOKEN}
+  echo
+  echo "========== 配置预览 =========="
+  echo "域名: ${domain:-<无>}"
+  echo "Upstream: http://127.0.0.1:${upstream_port}  (Docker 映射到容器 ${CONTAINER_PORT})"
+  echo "镜像: ${docker_image}"
+  echo "容器名: ${APP_NAME}"
+  echo "普通 Token: /${normal_token}"
+  echo "管理员 Token: /${admin_token}"
+  echo "Cloudflare: ${use_cf}"
+  echo "HTTPS: ${enable_https}"
+  echo "接管 Nginx: ${takeover}"
+  echo "=============================="
+  echo
 
-管理员后台:
-  ${BASE_HTTPS_URL:-$BASE_HTTP_URL}/${ADMIN_TOKEN}
+  # 安装基础组件
+  log "安装/更新依赖（nginx / docker / certbot / jq）..."
+  apt_install_base
+  ok "依赖已安装"
 
-[Docker]
-  容器: ${CONTAINER_NAME}
-  镜像: ${IMAGE}
-  端口: ${HOST_PORT} -> ${CONTAINER_PORT}
+  # 清理旧容器
+  docker_clean_previous
 
-[Nginx]
-  启用: ${NGINX_ENABLE}
-  域名: ${DOMAIN:-<无>}
-  Upstream: 127.0.0.1:${HOST_PORT}
+  # Nginx 清理（可选）
+  nginx_takeover_cleanup "$takeover"
 
-[Cloudflare DNS]
-  启用: ${CF_ENABLE}
-  proxied: ${CF_PROXIED}
-  zone_id: ${CF_ZONE_ID:-<无>}
+  # 启动 Docker 服务
+  log "拉取并启动弹幕容器..."
+  docker pull "$docker_image"
+  docker run -d \
+    --name "$APP_NAME" \
+    --restart unless-stopped \
+    -p "${upstream_port}:${CONTAINER_PORT}" \
+    "$docker_image"
+  ok "容器已启动：$APP_NAME"
 
-[HTTPS]
-  启用: ${HTTPS_ENABLE}
-  模式: ${HTTPS_MODE}
-  邮箱: ${LE_EMAIL:-<无>}
+  # 域名为空：直接输出 IP:端口访问方式
+  if [[ -z "$domain" ]]; then
+    cat > "$INFO_FILE" <<EOF
+[Danmu 安装完成 - 无域名模式]
+访问方式（你需要用服务器公网 IP）：
 
-[常用命令]
-  查看容器: docker ps
-  看日志:   docker logs -f ${CONTAINER_NAME}
-  重启容器: docker restart ${CONTAINER_NAME}
-  测试 Nginx: nginx -t
+普通：
+  http://<你的服务器IP>:${upstream_port}/${normal_token}
+
+管理：
+  http://<你的服务器IP>:${upstream_port}/${admin_token}
+
+Docker:
+  容器：${APP_NAME}
+  镜像：${docker_image}
+  端口：${upstream_port} -> ${CONTAINER_PORT}
+
+提示：
+- 如果你不想暴露 IP，建议使用域名 + Cloudflare 橙云，然后启用 HTTPS。
+EOF
+    ok "安装完成。输出文件：$INFO_FILE"
+    echo
+    echo "===== 访问地址（无域名）====="
+    echo "普通： http://<你的服务器IP>:${upstream_port}/${normal_token}"
+    echo "管理： http://<你的服务器IP>:${upstream_port}/${admin_token}"
+    echo "============================"
+    exit 0
+  fi
+
+  # 域名模式：写 Nginx
+  mkdir -p /var/www/html
+  log "配置 Nginx（域名站点）..."
+  if [[ "$enable_https" == "y" ]]; then
+    # 先写 HTTP-only，确保 ACME 走得通
+    write_nginx_http_only_conf "$domain" "/var/www/html"
+    nginx_reload_strict
+    ok "HTTP 站点已就绪（用于申请证书）"
+
+    warn "申请证书时：建议 Cloudflare 暂时灰云（DNS only）。证书成功后再开橙云。"
+    log "申请 Let's Encrypt 证书..."
+    certbot_issue_webroot "$domain" "$email" "/var/www/html"
+    ok "证书申请成功"
+
+    # 写入最终 HTTPS 配置
+    write_nginx_https_conf "$domain" "/var/www/html" "$upstream_port"
+    nginx_reload_strict
+    ok "HTTPS 反代已启用"
+  else
+    # HTTP 反代
+    local conf="/etc/nginx/sites-available/${domain}.conf"
+    cat > "$conf" <<EOF
+# ${domain} - managed by danmu install script (HTTP only)
+server {
+  listen 80;
+  server_name ${domain};
+
+  location / {
+    proxy_pass http://127.0.0.1:${upstream_port};
+    proxy_http_version 1.1;
+
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+  }
+}
+EOF
+    ln -sf "$conf" "/etc/nginx/sites-enabled/${domain}.conf"
+    nginx_reload_strict
+    ok "HTTP 反代已启用"
+  fi
+
+  # 输出信息
+  local scheme="http"
+  [[ "$enable_https" == "y" ]] && scheme="https"
+
+  cat > "$INFO_FILE" <<EOF
+[Danmu 安装完成]
+域名：${domain}
+协议：${scheme}
+Nginx -> Upstream：http://127.0.0.1:${upstream_port}
+Docker：${APP_NAME} (${docker_image})
+
+普通访问：
+  ${scheme}://${domain}/${normal_token}
+
+管理访问：
+  ${scheme}://${domain}/${admin_token}
+
+常用命令：
+  docker logs -f ${APP_NAME}
+  docker restart ${APP_NAME}
+  nginx -t && systemctl reload nginx
+
+HTTPS 续期：
+  certbot renew --dry-run
 EOF
 
-c_grn "[OK] 安装完成。已输出到：${INFO_FILE}"
-echo
-c_cyn "==== 访问地址（请复制）===="
-echo "普通：${BASE_HTTPS_URL:-$BASE_HTTP_URL}/${PUBLIC_TOKEN}"
-echo "管理：${BASE_HTTPS_URL:-$BASE_HTTP_URL}/${ADMIN_TOKEN}"
-c_cyn "==========================="
-echo
+  ok "安装完成。输出文件：$INFO_FILE"
+  echo
+  echo "===== 访问地址（请复制）====="
+  echo "普通： ${scheme}://${domain}/${normal_token}"
+  echo "管理： ${scheme}://${domain}/${admin_token}"
+  echo "输出： ${INFO_FILE}"
+  echo "============================"
+
+  # 提醒冲突排查
+  if nginx -t 2>&1 | grep -qi "conflict"; then
+    warn "检测到 Nginx 有冲突提示（conflicting server name）。"
+    warn "执行：nginx -T | grep -n \"server_name ${domain}\"  可以定位重复站点。"
+  fi
+}
+
+main "$@"
