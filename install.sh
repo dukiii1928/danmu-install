@@ -347,32 +347,36 @@ main() {
 
   local use_cf="n"
   local cf_token="" cf_zone_id="" cf_proxied="true" server_ip=""
+
+  # 是否在输出里隐藏真实 IP（默认隐藏，避免你把日志/截图发给别人时泄露）
   local hide_ip_output="y"
+  if yesno "是否在脚本输出/总结里隐藏服务器真实IP？（推荐）" "y"; then
+    hide_ip_output="y"
+  else
+    hide_ip_output="n"
+  fi
+
   if [ -n "$domain" ] && yesno "是否使用 Cloudflare API 自动创建/更新 DNS A 记录？（需要 Token）" "n"; then
     use_cf="y"
     echo "建议 Token 权限：Zone:Read + DNS:Edit（仅限该域）"
     cf_token="$(ask "输入 Cloudflare API Token" "")"
     cf_zone_id="$(ask "输入 Cloudflare Zone ID（概览里“区域ID/Zone ID”那串）" "")"
-    if yesno "A 记录是否开启橙云代理（Proxied）？" "y"; then
 
-    local hide_ip_output="y"
-    if yesno "是否在脚本输出/总结里隐藏服务器真实IP？（推荐）" "y"; then
-      hide_ip_output="y"
-    else
-      hide_ip_output="n"
-    fi
+    if yesno "A 记录是否开启橙云代理（Proxied）？" "y"; then
       cf_proxied="true"
     else
       cf_proxied="false"
     fi
 
-    server_ip="$(ask "Cloudflare DNS A 记录要指向的服务器公网 IP（建议填你的服务器IP；留空则自动探测，但不会回显）" "")"
+    # 这里让你决定 DNS 记录指向哪个 IP：
+    # - 不想暴露真实 IP：可以填一个“随便的”假 IP（但域名将无法访问）
+    # - 要域名可用：必须填真实服务器公网 IP（建议留空让脚本自动探测）
+    server_ip="$(ask "Cloudflare DNS A 记录要指向的服务器公网 IP（留空自动探测；不会回显）" "")"
     if [ -z "$server_ip" ]; then
       server_ip="$(detect_public_ip)"
     fi
     if [ -z "$server_ip" ]; then
       server_ip="$(ask "自动探测公网 IP 失败，请手动输入服务器公网 IP" "")"
-    fi
     fi
   fi
 
