@@ -165,7 +165,9 @@ install_nginx_certbot(){
 
 write_nginx_site(){
   # 生成站点配置：/etc/nginx/sites-available/<domain>.conf
-  local domain="$1" upstream="127.0.0.1:${NGINX_UPSTREAM_PORT}" enable_https="$2"
+  # 注意：脚本启用了 set -u（引用未定义变量会直接退出）。这里给上游端口一个安全默认值。
+  local upstream_port="${NGINX_UPSTREAM_PORT:-8080}"
+  local domain="$1" upstream="127.0.0.1:${upstream_port}" enable_https="$2"
   local conf="/etc/nginx/sites-available/${domain}.conf"
   local link="/etc/nginx/sites-enabled/${domain}.conf"
 
