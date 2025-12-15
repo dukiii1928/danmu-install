@@ -23,7 +23,6 @@ CRON_FILE="/etc/cron.d/danmu-api-autoupdate"
 
 log(){ echo "[INFO] $*"; }
 die(){ echo "[ERROR] $*" >&2; exit 1; }
-
 need(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
 
 compose_cmd(){
@@ -67,6 +66,62 @@ get_ip(){
   ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}'
 }
 
+setup_nginx_https(){
+  local domain="$1"
+  local upstream_port="$2"
+
+  log "安装 Nginx + Certbot..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt update -y
+  apt install -y nginx certbot python3-certbot-nginx
+
+  systemctl enable nginx
+  systemctl start nginx
+
+  # 写站点配置（token 路由模式）
+  local conf_name="${domain}.conf"
+  local conf_avail="/etc/nginx/sites-available/${conf_name}"
+  local conf_enabled="/etc/nginx/sites-enabled/${conf_name}"
+
+  # 避免重复启用导致 server_name 冲突
+  rm -f "${conf_enabled}"
+
+  cat >"${conf_avail}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+    # /TOKEN 和 /TOKEN/ 兼容，并把 token + 后续路径原样转发给后端
+    location ~ ^/([^/]+)(/.*)?$ {
+        set \$token \$1;
+        set \$rest  \$2;
+        if (\$rest = "") { set \$rest "/"; }
+
+        proxy_pass http://127.0.0.1:${upstream_port}/\$token\$rest;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+  ln -sf "${conf_avail}" "${conf_enabled}"
+
+  nginx -t
+  systemctl reload nginx
+
+  log "申请/部署 HTTPS 证书（需要域名已解析到本机，且放行 80/443）..."
+  # 邮箱用占位，用户可自行改；失败也不终止（避免脚本整体失败）
+  certbot --nginx -d "${domain}" --non-interactive --agree-tos -m "admin@${domain}" --redirect || true
+
+  nginx -t
+  systemctl reload nginx
+}
+
 need docker
 COMPOSE="$(compose_cmd)"
 
@@ -81,7 +136,7 @@ if container_exists || [ -d "${APP_DIR}" ]; then
   fi
 fi
 
-PORT="$(ask '请输入端口' "${DEFAULT_PORT}")"
+PORT="$(ask '请输入后端端口（本机端口，供 Nginx 反代）' "${DEFAULT_PORT}")"
 port_in_use "${PORT}" && yn "端口被占用，继续？" N || true
 
 TOKEN="$(ask '普通 TOKEN' "${DEFAULT_TOKEN}")"
@@ -116,6 +171,15 @@ fi
 AUTO_UPDATE=false
 yn "是否启用每天凌晨自动更新？" N && AUTO_UPDATE=true
 
+# 绑定域名（可选）
+SETUP_DOMAIN=false
+DOMAIN=""
+if yn "是否自动绑定域名并配置 HTTPS（Nginx+Certbot）？" Y; then
+  SETUP_DOMAIN=true
+  DOMAIN="$(ask '请输入域名（例如 dm.dukiii1928.xyz）' "")"
+  [[ -z "${DOMAIN}" ]] && die "域名不能为空"
+fi
+
 mkdir -p "${CONFIG_DIR}" "${CACHE_DIR}"
 
 cat > "${ENV_FILE}" <<EOF
@@ -141,7 +205,7 @@ services:
     image: ${IMAGE}
     container_name: ${CONTAINER_NAME}
     ports:
-      - "${PORT}:9321"
+      - "127.0.0.1:${PORT}:9321"
     volumes:
       - ./config:/app/config
       - ./.cache:/app/.cache
@@ -151,17 +215,36 @@ EOF
 ${COMPOSE} -f "${COMPOSE_FILE}" pull
 ${COMPOSE} -f "${COMPOSE_FILE}" up -d
 
+# 可选：自动更新
 if ${AUTO_UPDATE} && [ "$(id -u)" = "0" ]; then
   cat > "${CRON_FILE}" <<EOF
 5 3 * * * root cd ${APP_DIR} && ${COMPOSE} pull && ${COMPOSE} up -d > /var/log/danmu-api-autoupdate.log 2>&1
 EOF
 fi
 
+# 可选：配置域名 + HTTPS
+if ${SETUP_DOMAIN} && [ "$(id -u)" = "0" ]; then
+  setup_nginx_https "${DOMAIN}" "${PORT}"
+fi
+
 IP="$(get_ip)"
 
 echo ""
 echo "=== 安装完成 ==="
-echo "普通访问:"
-echo "  http://${IP}:${PORT}/${TOKEN}"
-echo "管理员访问:"
-echo "  http://${IP}:${PORT}/${ADMIN_TOKEN}"
+echo "后端本机端口（供 Nginx 反代）:"
+echo "  http://127.0.0.1:${PORT}/${TOKEN}"
+echo ""
+
+if ${SETUP_DOMAIN}; then
+  echo "普通访问:"
+  echo "  https://${DOMAIN}/${TOKEN}"
+  echo "管理员访问:"
+  echo "  https://${DOMAIN}/${ADMIN_TOKEN}"
+  echo ""
+  echo "提示：请确保 Cloudflare/阿里云安全组已放行 80/443，DNS 已解析到本机公网 IP。"
+else
+  echo "普通访问（直连端口，未绑定域名）:"
+  echo "  http://${IP}:${PORT}/${TOKEN}"
+  echo "管理员访问（直连端口，未绑定域名）:"
+  echo "  http://${IP}:${PORT}/${ADMIN_TOKEN}"
+fi
